@@ -474,7 +474,10 @@ var PIECE_NOUN = {
 };
 
 /* Paper-ish kinds share sounds and the seeded visual-variety system. */
-var PAPER_FAMILY = { corkboard: 1, folder: 1, photo: 1, rx: 1 };
+/* Photo is deliberately NOT here: it renders its own pure-CSS Polaroid
+   frame + window so the clue image lines up exactly inside the borders,
+   and it takes no corner-fold, tape, or seeded flip. */
+var PAPER_FAMILY = { corkboard: 1, folder: 1, rx: 1 };
 
 var TRAY_NAMES = ['tray A', 'tray B', 'tray C', 'tray D'];
 
@@ -863,12 +866,12 @@ var SOUND_TUNING = {
   'dial-tick':    { synth: 'tick', freq: 1800, dur: 0.028, gain: 0.2 },
   'pan-tick':     { synth: 'tick', freq: 1250, dur: 0.02, gain: 0.1 },
   'print':        { synth: 'print', dur: 0.45, gain: 0.16 },
-  /* "Scatter" cue — a layered paper riffle, not a click: 4-6 overlapping
-     rustle bursts staggered 30-80ms apart with a slight pitch spread,
-     landing around 400-600ms total with a quiet tail (later bursts fade). */
-  'shuffle':      { synth: 'shuffle', bursts: 6, staggerLo: 0.04, staggerHi: 0.08,
-                     durLo: 0.13, durHi: 0.2, hpLo: 650, hpHi: 1150, lpLo: 3600, lpHi: 6200,
-                     rateLo: 0.92, rateHi: 1.14, tailFalloff: 0.6, gain: 0.22 },
+  /* "Scatter" cue — one smooth continuous whoosh, like a sheet of paper
+     moving through air: a single noise source through a bandpass whose
+     center sweeps 400→1200→600 Hz, with a gently ramped attack and a
+     smooth decay to silence. No discrete bursts, no abrupt gain steps. */
+  'shuffle':      { synth: 'shuffle', dur: 0.7, f0: 400, f1: 1200, f2: 600,
+                     q: 0.8, attack: 0.09, gain: 0.24 },
   'correct':      { synth: 'notes', freqs: [392, 523.25], noteDur: 0.16, gain: 0.2 },
   'wrong':        { synth: 'thud', freq: 108, dur: 0.24, gain: 0.34 },
   'wrong-crack':  { synth: 'noise', dur: 0.09, hp: 2400, lp: 9000, gain: 0.2, attack: 0.002 },
@@ -1028,25 +1031,35 @@ function synthPrint(ctx, t, o) {
   synthNoise(ctx, t, { hp: 1800, lp: 7000, gain: o.gain * 0.9, attack: 0.003, dur: 0.05 }, t + o.dur * 0.92);
 }
 
-/** "Scatter" cue: a paper riffle — several overlapping rustle grains
- *  staggered by a random gap each, each with its own pitch/tone jitter,
- *  fading out toward a quiet tail rather than four evenly-clicking beats. */
+/** "Scatter" cue: one smooth continuous whoosh — a single noise source
+ *  through a bandpass whose center sweeps up then down (paper moving
+ *  through air), with a gently ramped attack and a smooth decay to
+ *  silence. Every automation is a ramp; there are no discrete bursts
+ *  and no instant gain steps anywhere. */
 function synthShuffle(ctx, t, o) {
-  var bursts = o.bursts || 5;
-  var cursor = 0;
-  for (var i = 0; i < bursts; i++) {
-    if (i > 0) cursor += o.staggerLo + Math.random() * (o.staggerHi - o.staggerLo);
-    var frac = bursts > 1 ? i / (bursts - 1) : 0;
-    var tail = 1 - frac * (o.tailFalloff || 0);
-    synthNoise(ctx, t, {
-      hp: o.hpLo + Math.random() * (o.hpHi - o.hpLo),
-      lp: o.lpLo + Math.random() * (o.lpHi - o.lpLo),
-      dur: o.durLo + Math.random() * (o.durHi - o.durLo),
-      rate: o.rateLo + Math.random() * (o.rateHi - o.rateLo),
-      gain: o.gain * tail * (0.8 + Math.random() * 0.3),
-      attack: 0.006 + Math.random() * 0.012,
-    }, t + cursor);
-  }
+  var dur = o.dur || 0.7;
+  var peak = o.gain || 0.24;
+  var attack = o.attack || 0.09;
+  var src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  src.playbackRate.value = 0.9 + Math.random() * 0.12;
+  var bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.Q.value = o.q || 0.8;
+  // Center frequency sweeps 400 → 1200 → 600 Hz across the whoosh.
+  bp.frequency.setValueAtTime(o.f0 || 400, t);
+  bp.frequency.linearRampToValueAtTime(o.f1 || 1200, t + dur * 0.4);
+  bp.frequency.linearRampToValueAtTime(o.f2 || 600, t + dur);
+  // Gain: gentle ramped attack, then a smooth two-stage ramp to silence.
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(peak, t + attack);
+  g.gain.linearRampToValueAtTime(peak * 0.5, t + dur * 0.6);
+  g.gain.linearRampToValueAtTime(0.0001, t + dur);
+  g.connect(audio.master);
+  src.connect(bp).connect(g);
+  src.start(t, Math.random() * 0.3, dur + 0.1);
+  src.stop(t + dur + 0.05);
 }
 
 /** Load assets/sounds/manifest.json once; fetch listed override files. */
@@ -1661,7 +1674,14 @@ function openPuzzle(puzzleData) {
   els.pieceLayer.classList.add('no-anim');
   syncAll();
   requestAnimationFrame(function () {
-    requestAnimationFrame(function () { els.pieceLayer.classList.remove('no-anim'); });
+    // Re-measure once the header/tray HUD have settled: the first pass can
+    // run mid-layout (play-main momentarily taller), which would oversize
+    // the square and push the scope controls out the panel's bottom.
+    sizeViewer();
+    requestAnimationFrame(function () {
+      sizeViewer();
+      els.pieceLayer.classList.remove('no-anim');
+    });
   });
 
   persistGame();
@@ -1794,7 +1814,10 @@ function decoratePaperPiece(b, item, rng) {
   var skin = document.createElement('span');
   skin.className = 'piece-skin';
   skin.setAttribute('aria-hidden', 'true');
-  skin.style.setProperty('--skin-flip', rng() < 0.5 ? '1' : '-1');
+  // Seeded horizontal flip for variety — but never on rx (or photo, which
+  // no longer reaches here): flipping baked Rx/photo content reads backwards.
+  var flip = rng() < 0.5 ? '1' : '-1';
+  skin.style.setProperty('--skin-flip', item.zone === 'rx' ? '1' : flip);
   var bright = (0.965 + rng() * 0.07).toFixed(3);
   var hue = (-4 + rng() * 8).toFixed(1);
   skin.style.setProperty('--skin-filter', 'brightness(' + bright + ') hue-rotate(' + hue + 'deg)');
@@ -1845,13 +1868,17 @@ function sizeViewer() {
     els.scopeDisplayWrap.style.height = '';
     return;
   }
-  var headerEl = els.screenPlay.querySelector('.play-header');
-  var controlsH = 46; // zoom/pan row inside the panel
-  var chromeH = headerEl.getBoundingClientRect().height
-    + els.trayHud.getBoundingClientRect().height
-    + 46; // screen paddings + gaps
-  var avail = window.innerHeight - chromeH - controlsH;
-  var side = clamp(avail, 220, Math.min(680, window.innerWidth * 0.42));
+  // The panel is stretched by the play-main flex row to that row's height.
+  // Size the square display off the panel's REAL available inner height
+  // (row height minus the controls row and the panel's own padding/gap/
+  // borders) so the zoom + pan controls always sit INSIDE the panel rather
+  // than spilling out the bottom. Measuring beats a fudged chrome estimate.
+  var mainH = els.scopePanel.parentElement.getBoundingClientRect().height;
+  var controlsEl = els.scopePanel.querySelector('.scope-controls');
+  var controlsH = controlsEl ? controlsEl.getBoundingClientRect().height : 40;
+  var panelChromeV = 10 * 2 + 10 + 2; // padding top+bottom + column gap + borders
+  var availH = mainH - controlsH - panelChromeV;
+  var side = clamp(Math.min(availH, window.innerWidth * 0.42), 180, 680);
   els.scopeDisplayWrap.style.width = side + 'px';
   els.scopeDisplayWrap.style.height = side + 'px';
   els.scopePanel.style.width = (side + 22) + 'px';
@@ -2159,7 +2186,6 @@ function updateFilmLighting() {
   if (!state.game || !state.desk) return;
   if (!hasMachine('lightbox')) return; // no box, nothing lights
   var boxR = els.lightboxScreen.getBoundingClientRect();
-  var filmAspect = state.textureAspect && state.textureAspect['film.png'];
   state.game.puzzle.items.forEach(function (item) {
     if (item.zone !== 'tubes') return;
     var el = state.pieceEls[item.id];
@@ -2167,37 +2193,14 @@ function updateFilmLighting() {
     var lit = el.firstChild && el.querySelector('.film-lit');
     if (!lit) return;
     var r = el.getBoundingClientRect();
-
-    // `background-size: contain` (and the matching mask-size on .film-lit)
-    // fits the alpha-trimmed film texture inside the piece's CSS box —
-    // whenever the texture's aspect ratio doesn't match the box exactly,
-    // that leaves a letterboxed margin where nothing is actually drawn.
-    // Light must track the texture's real visible edges, not the box's,
-    // or the lit window reads as offset from the film ("refraction").
-    var visLeft = r.left, visRight = r.right, visTop = r.top, visBottom = r.bottom;
-    if (filmAspect && el.classList.contains('textured')) {
-      var boxAspect = r.width / r.height;
-      if (filmAspect < boxAspect) { // texture relatively taller — letterboxed left/right
-        var visW = r.height * filmAspect;
-        var padX = (r.width - visW) / 2;
-        visLeft = r.left + padX;
-        visRight = r.right - padX;
-      } else if (filmAspect > boxAspect) { // texture relatively wider — letterboxed top/bottom
-        var visH = r.width / filmAspect;
-        var padY = (r.height - visH) / 2;
-        visTop = r.top + padY;
-        visBottom = r.bottom - padY;
-      }
-    }
-
-    if (boxR.left >= visRight || boxR.right <= visLeft || boxR.top >= visBottom || boxR.bottom <= visTop) {
+    if (boxR.left >= r.right || boxR.right <= r.left || boxR.top >= r.bottom || boxR.bottom <= r.top) {
       lit.style.clipPath = 'inset(100%)';
       return;
     }
-    var top = Math.max(0, boxR.top - r.top, visTop - r.top);
-    var left = Math.max(0, boxR.left - r.left, visLeft - r.left);
-    var right = Math.max(0, r.right - boxR.right, r.right - visRight);
-    var bottom = Math.max(0, r.bottom - boxR.bottom, r.bottom - visBottom);
+    var top = Math.max(0, boxR.top - r.top);
+    var left = Math.max(0, boxR.left - r.left);
+    var right = Math.max(0, r.right - boxR.right);
+    var bottom = Math.max(0, r.bottom - boxR.bottom);
     lit.style.clipPath = 'inset(' + top.toFixed(1) + 'px ' + right.toFixed(1) + 'px ' + bottom.toFixed(1) + 'px ' + left.toFixed(1) + 'px)';
   });
 }

@@ -884,10 +884,11 @@ body.has-textures .piece.textured.is-dragging {
    corners around it — mask the lit layer with the film texture's alpha,
    sized to match the contain-fitted background underneath. (The old baked
    border this piece once had is gone now that textures are alpha-trimmed
-   at load — game.js's updateFilmLighting() computes the clip-path against
-   the texture's real letterboxed bounds, so no manual inset belongs here;
-   one used to live on this rule and caused the light to land off the
-   film's true edges.) The CSS etch hides — it would sit on the photo. */
+   at load — game.js's updateFilmLighting() clips the lit layer to the plain
+   geometric intersection of the film element's rect with the light box, so
+   no manual inset belongs here; a 7%/8% pad used to live on this rule and
+   caused the light to land off the film's true edges.) The CSS etch hides —
+   it would sit on the photo. */
 .piece-film.textured .film-lit {
   -webkit-mask-image: var(--tex-film);
   -webkit-mask-size: contain;
@@ -1089,6 +1090,10 @@ body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1;
   z-index: 1;
 }
 .rx-line { position: relative; z-index: 1; }
+/* When the rx texture is present it already carries a printed Rx, so the
+   CSS/DOM ℞ glyph would double it up — hide the glyph in that case only.
+   Texture absent (no .textured class) keeps the drawn glyph. */
+.piece-rx.textured .rx-glyph { display: none; }
 
 /* ── Slide letters (A, B, C… — identifiers, not hints) ───────────── */
 

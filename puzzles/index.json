@@ -1,0 +1,11 @@
+{
+  "current": "sample-001",
+  "puzzles": [
+    {
+      "id": "sample-001",
+      "title": "The Daily Desk",
+      "date": "2026-07-07",
+      "file": "sample-001.json"
+    }
+  ]
+}

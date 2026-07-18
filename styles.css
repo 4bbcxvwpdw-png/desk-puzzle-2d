@@ -1,0 +1,1614 @@
+/* Desk Puzzle — Paper Edition (2D)
+   Utopian Scholastic, on paper: warm cream ground, plum accent, no blue
+   anywhere, serif display type, museum-placard chrome. Light theme only.
+
+   Play screen: a top-down desk. Pieces are freely draggable physical
+   objects; the microscope stage, light box, and label printer are fixed
+   desk furniture; the microscope DISPLAY is a resizable panel to the
+   left of the desk; four group trays run along the bottom. Motion is
+   drag feedback + short settle transitions only, and fully collapses
+   under prefers-reduced-motion (bottom of this file).
+
+   Skeuomorphic textures: game.js probes each known filename in
+   assets/textures/ directly (no manifest) and, per file that loads,
+   sets --tex-* custom properties + `textured` classes. Absent textures
+   = the CSS-drawn look below, untouched. */
+
+:root {
+  --ink: #241f14;
+  --ink-soft: #5b5340;
+  --paper: #ede2c6;
+  --paper-grain-a: rgba(122, 79, 192, 0.035);
+  --paper-grain-b: rgba(36, 31, 20, 0.04);
+  --panel: rgba(250, 245, 231, 0.96);
+  --panel-edge: rgba(36, 31, 20, 0.18);
+  --accent: #7a4fc0;
+  --accent-ink: #ffffff;
+  --accent-soft: #efe6fb;
+
+  /* Tier colors — four warm, distinct, non-blue hues. */
+  --tier-1: #eab635;   /* butter yellow */
+  --tier-1-ink: #3a2c04;
+  --tier-2: #4f6b45;   /* sage */
+  --tier-2-ink: #f4f3e6;
+  --tier-3: #7a4fc0;   /* plum */
+  --tier-3-ink: #ffffff;
+  --tier-4: #a8501f;   /* terracotta */
+  --tier-4-ink: #fff6ea;
+
+  --danger: #b23a2f;
+  --serif: "Iowan Old Style", "Palatino Linotype", Georgia, "Times New Roman", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --hand: "Bradley Hand", "Noteworthy", "Marker Felt", "Segoe Print", cursive;
+  --mono: "SF Mono", Menlo, Consolas, monospace;
+
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 0.15s;
+  --dur: 0.22s;
+
+  /* one radius system: small = interactive, mid = panels, large = surfaces */
+  --r-s: 6px;
+  --r-m: 10px;
+  --r-l: 14px;
+
+  /* themed surfaces the components read (dark overrides below) */
+  --card: #ffffff;
+  --field-bg: #ffffff;
+  --toast-bg: #241f14;
+  --toast-ink: #fbf6e9;
+  --desk-hi: #a97f52;
+  --desk-mid: #8e6742;
+  --desk-lo: #9b7148;
+  --lightbox-a: #fdf3d8;
+  --lightbox-b: #f0dfae;
+  --lightbox-c: #ddc78e;
+  --lightbox-glow: rgba(253, 240, 205, 0.65);
+  --machine-shell-a: #efe9da;
+  --machine-shell-b: #d5ccb6;
+  --control-bg: #f4ecd9;
+  --slot-bg: rgba(255, 255, 255, 0.45);
+  --slot-bg-locked: rgba(255, 255, 255, 0.5);
+
+  color-scheme: light;
+}
+
+/* Warm dark: charcoal and walnut under the same plum accent. Paper
+   pieces keep their light faces for contrast; the room dims around them. */
+:root[data-theme="dark"] {
+  --ink: #ece4d2;
+  --ink-soft: #a99e88;
+  --paper: #201b15;
+  --paper-grain-a: rgba(122, 79, 192, 0.05);
+  --paper-grain-b: rgba(0, 0, 0, 0.25);
+  --panel: #2a241c;
+  --panel-edge: rgba(236, 228, 210, 0.16);
+  --accent: #9b74e0;
+  --accent-ink: #17120c;
+  --accent-soft: rgba(122, 79, 192, 0.22);
+  --danger: #e07263;
+  --card: #322b22;
+  --field-bg: #241f18;
+  --toast-bg: #ece4d2;
+  --toast-ink: #241f14;
+  --desk-hi: #4e3826;
+  --desk-mid: #3c2b1c;
+  --desk-lo: #452f1f;
+  --lightbox-a: #d9c391;
+  --lightbox-b: #b39a63;
+  --lightbox-c: #8e7845;
+  --lightbox-glow: rgba(217, 195, 145, 0.3);
+  --machine-shell-a: #3b342a;
+  --machine-shell-b: #2c261e;
+  --control-bg: #352e24;
+  --slot-bg: rgba(255, 255, 255, 0.06);
+  --slot-bg-locked: rgba(0, 0, 0, 0.18);
+  color-scheme: dark;
+}
+
+/* the photo desk dims with the room (machines on it dim too; pieces
+   live on a sibling layer and keep their daylight faces) */
+:root[data-theme="dark"] .desk-surface.textured {
+  filter: brightness(0.6) saturate(0.85);
+}
+
+* { box-sizing: border-box; }
+
+/* The overlays and error screen set their own display (flex), which would
+   otherwise beat the UA stylesheet's [hidden] rule — so re-assert it with
+   top priority. game.js shows elements by CLEARING `hidden`, never by
+   styling over it. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+}
+
+body {
+  background-image:
+    radial-gradient(circle at 15% 20%, var(--paper-grain-a) 0, transparent 45%),
+    radial-gradient(circle at 85% 75%, var(--paper-grain-b) 0, transparent 50%);
+  background-attachment: fixed;
+}
+
+h1, h2, h3 {
+  font-family: var(--serif);
+  color: var(--ink);
+  margin: 0 0 0.4em;
+}
+
+p { margin: 0 0 0.6em; }
+
+button { font-family: inherit; cursor: pointer; }
+
+img { max-width: 100%; display: block; }
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────── */
+
+.btn {
+  font-family: var(--sans);
+  font-size: 0.92rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0.55em 1.1em;
+  border-radius: var(--r-s);
+  border: 1px solid var(--panel-edge);
+  background: var(--panel);
+  color: var(--ink);
+  transition: background var(--dur-fast), border-color var(--dur-fast), transform var(--dur-fast);
+}
+.btn:hover:not(:disabled) { background: var(--accent-soft); border-color: var(--accent); }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.btn-primary:hover:not(:disabled) { background: #6c44ab; }
+
+.btn-ghost { background: transparent; }
+
+/* ══════════════════════ SCREENS ══════════════════════ */
+
+.screen {
+  min-height: 100vh;
+  padding: 24px 20px 60px;
+}
+
+/* ── Menu ────────────────────────────────────────────────────────── */
+
+.menu-header {
+  max-width: 640px;
+  margin: 0 auto 28px;
+  text-align: center;
+}
+
+.game-title {
+  font-size: clamp(1.8rem, 5vw, 2.6rem);
+  line-height: 1.15;
+}
+.game-title-sub {
+  display: block;
+  font-size: 0.42em;
+  font-weight: 400;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-top: 0.3em;
+}
+
+.game-tagline { color: var(--ink-soft); font-size: 1.02rem; }
+
+.menu-panel {
+  max-width: 560px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.btn-play-today { font-size: 1.1rem; padding: 0.9em 1.4em; }
+
+.menu-section {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+.menu-section h2 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+  font-family: var(--sans);
+  font-weight: 700;
+  border-bottom: 1px solid var(--panel-edge);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+
+.how-to-play ol {
+  margin: 0;
+  padding-left: 1.2em;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.how-to-play li { line-height: 1.45; }
+
+.archive-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.archive-item-btn {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-family: inherit;
+  color: var(--ink);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  transition: background var(--dur-fast), transform var(--dur-fast) var(--ease);
+}
+.archive-item-btn:hover { background: var(--accent-soft); transform: translateX(2px); }
+.archive-item-btn .archive-date { color: var(--ink-soft); font-size: 0.85rem; white-space: nowrap; }
+.archive-item-btn.current { border-color: var(--accent); }
+.archive-empty { color: var(--ink-soft); font-style: italic; margin: 0; }
+
+.menu-settings { display: flex; flex-direction: column; gap: 10px; }
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.96rem;
+  cursor: pointer;
+}
+.toggle-row input { width: 18px; height: 18px; accent-color: var(--accent); }
+
+/* ── Play screen chrome ──────────────────────────────────────────── */
+
+.screen-play {
+  height: 100dvh;
+  max-width: 1720px;
+  margin: 0 auto;
+  padding: 10px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* viewer left, desk right, equal vertical height */
+.play-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 14px;
+}
+
+/* full-width tray HUD bar pinned at the bottom of the play column */
+.tray-hud {
+  flex: 0 0 auto;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 2px solid var(--panel-edge);
+}
+
+.play-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 4px 4px 10px;
+  border-bottom: 1px solid var(--panel-edge);
+  margin-bottom: 12px;
+}
+.play-header-title h1 { font-size: 1.3rem; margin: 0; }
+.play-header-title p { margin: 0; color: var(--ink-soft); font-size: 0.85rem; }
+
+.mistake-tracker {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+.mistake-tracker .pips { display: flex; gap: 7px; }
+.pip {
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--accent);
+  transition: background var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.pip.used { background: transparent; transform: scale(0.9); }
+
+.play-actions { display: flex; gap: 8px; }
+.play-actions .btn { padding: 0.5em 0.9em; font-size: 0.88rem; }
+
+/* ══════════ MICROSCOPE VIEWER (permanent, square, left) ══════════ */
+
+.scope-panel {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--r-l);
+  padding: 10px;
+  min-width: 0;
+}
+
+.scope-display-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  /* square dimensions set by game.js sizeViewer(); CSS handles <900px */
+  border-radius: var(--r-s);
+  overflow: hidden;
+  border: 3px solid #4d4437;
+  background: #efe6d6; /* a lit screen stays lit in dark mode too */
+  box-shadow: inset 0 0 14px rgba(60, 46, 24, 0.25);
+}
+.scope-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+.scope-canvas.is-panning { cursor: grabbing; }
+
+.scope-controls {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Zoom: a drag control with three detents (4x / 10x / 40x) ────── */
+.zoom-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  max-width: 340px;
+}
+.zoom-current {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--accent);
+  min-width: 36px;
+  text-align: right;
+}
+.zoom-track {
+  position: relative;
+  flex: 1;
+  height: 30px;
+  background: var(--control-bg);
+  border: 1px solid var(--panel-edge);
+  border-radius: 999px; /* physical slider: the one intentional pill */
+  touch-action: none;
+  cursor: grab;
+}
+.zoom-track:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.zoom-detent {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: var(--ink-soft);
+  pointer-events: none;
+}
+.zoom-detent[data-stop="0"] { left: 12%; }
+.zoom-detent[data-stop="1"] { left: 50%; }
+.zoom-detent[data-stop="2"] { left: 88%; }
+.zoom-knob {
+  position: absolute;
+  top: 50%;
+  left: 12%;
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--accent);
+  box-shadow: 0 2px 5px rgba(36, 31, 20, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition: left 0.12s var(--ease);
+  pointer-events: none;
+}
+.zoom-track.is-dragging { cursor: grabbing; }
+.zoom-track.is-dragging .zoom-knob { transition: none; }
+
+.scope-pan {
+  display: grid;
+  grid-template-areas: ". up ." "left down right";
+  gap: 3px;
+}
+.pan-btn {
+  width: 26px; height: 24px;
+  border: 1px solid var(--panel-edge);
+  background: var(--control-bg);
+  border-radius: var(--r-s);
+  font-size: 0.6rem;
+  color: var(--ink-soft);
+  line-height: 1;
+  padding: 0;
+}
+.pan-btn:hover { background: var(--accent-soft); }
+.pan-up { grid-area: up; }
+.pan-left { grid-area: left; }
+.pan-right { grid-area: right; }
+.pan-down { grid-area: down; }
+
+/* ══════════════════════ THE DESK (top-down) ══════════════════════ */
+
+.play-area {
+  position: relative;
+  /* Nothing on the desk is prose — dragging across machine labels, tray
+     titles, or Lock In buttons must never start a text selection. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.play-area { display: flex; flex: 1 1 auto; min-width: 0; }
+.desk-surface {
+  position: relative;
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  border-radius: 16px;
+  border: 1px solid rgba(60, 40, 18, 0.45);
+  /* Warm top-down wood: plank seams + fine grain + soft lamp pool. */
+  background-image:
+    radial-gradient(ellipse at 50% 30%, rgba(255, 240, 205, 0.20) 0, transparent 60%),
+    repeating-linear-gradient(90deg,
+      rgba(58, 38, 16, 0.16) 0 2px, transparent 2px 118px),
+    repeating-linear-gradient(0deg,
+      rgba(255, 235, 200, 0.045) 0 3px, transparent 3px 9px),
+    repeating-linear-gradient(90deg,
+      rgba(90, 60, 28, 0.05) 0 7px, transparent 7px 23px),
+    linear-gradient(135deg, var(--desk-hi), var(--desk-mid) 55%, var(--desk-lo));
+  box-shadow:
+    inset 0 2px 6px rgba(255, 240, 210, 0.25),
+    inset 0 -3px 8px rgba(40, 24, 8, 0.3),
+    0 4px 14px rgba(36, 31, 20, 0.18);
+}
+/* Photo desk texture (assets/textures/desk.jpg). */
+.desk-surface.textured {
+  background-image: var(--tex-desk);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/* ── Machines (fixed desk furniture) ────────────────────────────── */
+
+.machine {
+  position: absolute;
+  top: 14px;
+  z-index: 1;
+}
+.machine-label {
+  position: absolute;
+  left: 0; right: 0;
+  bottom: -20px;
+  margin: 0;
+  text-align: center;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  font-weight: 700;
+  color: rgba(255, 244, 224, 0.85);
+  text-shadow: 0 1px 2px rgba(40, 24, 8, 0.5);
+  white-space: nowrap;
+}
+.machine-caption {
+  position: absolute;
+  bottom: 4px;
+  left: 0; right: 0;
+  text-align: center;
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: rgba(255, 244, 224, 0.8);
+}
+
+/* Microscope stage (drop target; the display lives in the left panel). */
+.machine-scope { left: 16px; }
+.scope-stage {
+  position: relative;
+  width: 116px;
+  height: 116px;
+  border-radius: 14px;
+  background: linear-gradient(160deg, #4d4437, #382f24);
+  border: 2px solid rgba(255, 240, 210, 0.25);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.4), 0 3px 8px rgba(36, 31, 20, 0.3);
+}
+.scope-stage-glass {
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 78px; height: 78px;
+  transform: translate(-50%, -54%);
+  border-radius: 50%;
+  background: radial-gradient(circle at 45% 40%, rgba(255, 250, 235, 0.95), rgba(245, 232, 205, 0.75) 55%, rgba(200, 180, 145, 0.5));
+  box-shadow: 0 0 14px rgba(255, 246, 220, 0.55), inset 0 0 8px rgba(120, 96, 60, 0.35);
+}
+.scope-stage.drop-hot { outline: 3px dashed var(--accent-soft); outline-offset: 3px; }
+
+/* Light box: an always-lit warm glass panel. Films reveal their content
+   only where they physically overlap it (clip-path on .film-lit). */
+.machine-lightbox { right: 16px; }
+.lightbox-screen {
+  width: 250px;
+  height: 150px;
+  border-radius: 10px;
+  border: 3px solid #57503f;
+  /* Warm white/amber glow — deliberately NOT blue. */
+  background: radial-gradient(ellipse at 50% 40%, var(--lightbox-a), var(--lightbox-b) 70%, var(--lightbox-c));
+  box-shadow: 0 0 22px var(--lightbox-glow), inset 0 0 10px rgba(120, 96, 50, 0.3);
+}
+
+/* Label printer: bottom-right of the desk. */
+.machine-printer { top: auto; bottom: 24px; right: 24px; }
+.printer-body {
+  position: relative;
+  width: 118px;
+  height: 62px;
+  border-radius: 10px 10px 6px 6px;
+  background: linear-gradient(170deg, var(--machine-shell-a), var(--machine-shell-b));
+  border: 1px solid rgba(60, 40, 18, 0.45);
+  box-shadow: 0 3px 8px rgba(36, 31, 20, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+.printer-slit {
+  position: absolute;
+  top: 14px; left: 12px; right: 12px;
+  height: 6px;
+  border-radius: 3px;
+  background: #2c2820;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.7);
+}
+.printer-count {
+  position: absolute;
+  bottom: 8px; left: 0; right: 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+.printer-count .label-chip {
+  width: 16px; height: 10px;
+  border-radius: 2px;
+  background: #fff;
+  border: 1px solid rgba(36, 31, 20, 0.35);
+}
+.printer-count .label-chip.spent { background: transparent; border-style: dashed; opacity: 0.5; }
+.machine-printer.drop-hot .printer-body { outline: 3px dashed var(--accent-soft); outline-offset: 3px; }
+
+/* ── Group trays ─────────────────────────────────────────────────── */
+
+.trays {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.tray {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: 12px;
+  padding: 10px;
+  transition: background var(--dur) var(--ease), box-shadow var(--dur);
+}
+.tray.drop-hot { box-shadow: 0 0 0 3px var(--accent); }
+.tray.is-locked { background: var(--group-color, var(--accent-soft)); border-color: transparent; }
+
+.tray-header {
+  text-align: center;
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--ink-soft);
+  padding: 4px 4px 8px;
+}
+.tray.is-locked .tray-header {
+  color: var(--group-ink, var(--ink));
+  font-family: var(--serif);
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.tray-slots {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+.tray-slot {
+  aspect-ratio: 5 / 3;
+  min-height: 48px;
+  border: 1.5px dashed var(--panel-edge);
+  border-radius: 8px;
+  background: var(--slot-bg);
+  transition: border-color var(--dur-fast);
+}
+.tray.is-locked .tray-slot {
+  border-color: transparent;
+  background: var(--slot-bg-locked);
+}
+.tray-slot.wrong-shake { animation: shake 0.35s var(--ease); }
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+
+.btn-lock { width: 100%; margin-top: 8px; }
+
+/* ══════════════════════ PIECES ══════════════════════ */
+
+.piece-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+.piece-layer.no-anim .piece { transition: none !important; }
+
+.piece {
+  all: unset;
+  box-sizing: border-box;
+  position: absolute;
+  left: 0; top: 0;
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transform: translate(-50%, -50%) rotate(var(--rot, 0deg)) scale(calc(var(--pc-scale, 1) * var(--type-scale, 1)));
+  transition:
+    left var(--dur) var(--ease),
+    top var(--dur) var(--ease),
+    transform var(--dur) var(--ease),
+    box-shadow var(--dur-fast),
+    opacity var(--dur);
+  word-break: break-word;
+}
+.piece:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.piece.is-dragging {
+  transition: none;
+  cursor: grabbing;
+  --pc-scale: 1.07;
+  filter: drop-shadow(0 8px 14px rgba(36, 31, 20, 0.35));
+}
+.piece.is-locked { cursor: default; }
+.piece.in-tray { --pc-scale: 0.82; }
+.piece.on-machine { --pc-scale: 0.9; }
+
+/* Handwritten clue labels — applied only when the texture pass is live,
+   so the plain-CSS build looks exactly as it did before. */
+body.has-textures .piece-label {
+  font-family: var(--hand);
+  color: #2b2b33;
+  display: inline-block;
+  transform: rotate(var(--ink-rot, 0deg));
+  font-size: calc(1em * var(--ink-size, 1));
+}
+
+/* Generated object textures include transparent padding and irregular edges.
+   Keep the complete cutout visible rather than cropping it into the CSS box,
+   and let the shadow follow the cutout's alpha instead of the box. */
+body.has-textures .piece.textured {
+  background-color: transparent;
+  background-size: contain;
+  background-position: center;
+  background-repeat: no-repeat;
+  border-color: transparent;
+  box-shadow: none;
+  filter: drop-shadow(0 3px 5px rgba(36, 31, 20, 0.32));
+}
+body.has-textures .piece.textured.is-dragging {
+  filter: drop-shadow(0 8px 14px rgba(36, 31, 20, 0.35));
+}
+
+/* Sticky note (corkboard items). */
+.piece-sticky {
+  --type-scale: var(--scale-sticky, 1);
+  width: 86px;
+  min-height: 74px;
+  padding: 8px;
+  background: var(--pc-color, #f6e58d);
+  box-shadow: 0 3px 7px rgba(36, 31, 20, 0.28), inset 0 0 0 1px rgba(36, 31, 20, 0.06);
+  font-size: 0.8rem;
+  line-height: 1.2;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+}
+.piece-sticky::after {
+  content: "";
+  position: absolute;
+  top: 3px; right: 5px;
+  width: 22px; height: 12px;
+  background: rgba(255, 255, 255, 0.4);
+  transform: rotate(-4deg);
+}
+.piece-sticky.textured::after { content: none; }
+
+/* Paper sheet (folder items). */
+.piece-paper {
+  --type-scale: var(--scale-paper, 1);
+  width: 80px;
+  min-height: 100px;
+  padding: 10px 8px;
+  background: #fbf6e9;
+  border: 1px solid rgba(36, 31, 20, 0.18);
+  box-shadow: 0 3px 7px rgba(36, 31, 20, 0.25);
+  font-size: 0.78rem;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+  background-image: repeating-linear-gradient(180deg, transparent 0 14px, rgba(36, 31, 20, 0.07) 14px 15px);
+}
+/* The ruled-line placeholder is CSS-drawn paper; once a real paper texture
+   loads it renders on the .piece-skin child instead, so the ruled lines
+   must not keep bleeding through underneath it. */
+.piece-paper.textured { background-image: none; }
+
+/* Index card (deskCards items). */
+.piece-card {
+  --type-scale: var(--scale-card, 1);
+  width: 98px;
+  min-height: 62px;
+  padding: 8px;
+  background: #f8f2e0;
+  border: 1px solid rgba(36, 31, 20, 0.18);
+  box-shadow: 0 3px 7px rgba(36, 31, 20, 0.25);
+  font-size: 0.8rem;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+  background-image: linear-gradient(rgba(178, 58, 47, 0.35) 0 1.5px, transparent 1.5px);
+  background-size: 100% 15px;
+  background-position: 0 9px;
+}
+
+/* Microscope slide (rack items) — NOT legible on the piece. */
+.piece-slide {
+  --type-scale: var(--scale-slide, 1);
+  width: 96px;
+  height: 44px;
+  border-radius: 3px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.2)),
+    radial-gradient(ellipse at 62% 55%, rgba(214, 120, 150, 0.5), rgba(214, 120, 150, 0.08) 65%),
+    #eef1ec;
+  border: 1px solid rgba(36, 31, 20, 0.25);
+  box-shadow: 0 2px 5px rgba(36, 31, 20, 0.22);
+  display: flex;
+  align-items: center;
+}
+.piece-slide.textured { background-image: var(--tex-slide); }
+/* The photo slide brings its own frosted end — keep the band transparent
+   so only the slide letter shows over it. */
+.piece-slide.textured .piece-frost {
+  background: transparent;
+  border-left: none;
+}
+/* The frosted (writing) end is where the letter belongs — slide.png draws
+   it on the right, so push the band there with margin-left:auto instead of
+   leaving it as the first (left) flex child, which sat over the clear glass. */
+.piece-slide .piece-frost {
+  width: 26px;
+  align-self: stretch;
+  margin-left: auto;
+  background: rgba(255, 255, 255, 0.75);
+  border-left: 1px solid rgba(36, 31, 20, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.piece-etch {
+  font-size: 6px;
+  color: rgba(60, 50, 30, 0.6);
+  filter: blur(1.3px);
+  transform: rotate(-90deg);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* X-ray film (tubes items) — dark; its content lights up ONLY where the
+   film overlaps the light box (clip-path set by game.js). Films never
+   rotate so the rect intersection stays exact. */
+.piece-film {
+  --type-scale: var(--scale-film, 1);
+  width: 118px;
+  height: 148px;
+  border-radius: 4px;
+  background:
+    radial-gradient(ellipse at 50% 42%, rgba(250, 240, 215, 0.10) 0 18%, transparent 55%),
+    linear-gradient(160deg, #2f2b24, #211d17);
+  border: 2px solid rgba(250, 240, 215, 0.14);
+  box-shadow: 0 3px 7px rgba(20, 14, 6, 0.45);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 4px;
+  overflow: hidden;
+}
+.piece-film.textured { background-image: var(--tex-film); }
+/* Light must only shine through the actual film cutout, not the box
+   corners around it — mask the lit layer with the film texture's alpha,
+   sized to match the contain-fitted background underneath. (The old baked
+   border this piece once had is gone now that textures are alpha-trimmed
+   at load — game.js's updateFilmLighting() computes the clip-path against
+   the texture's real letterboxed bounds, so no manual inset belongs here;
+   one used to live on this rule and caused the light to land off the
+   film's true edges.) The CSS etch hides — it would sit on the photo. */
+.piece-film.textured .film-lit {
+  -webkit-mask-image: var(--tex-film);
+  -webkit-mask-size: contain;
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  mask-image: var(--tex-film);
+  mask-size: contain;
+  mask-position: center;
+  mask-repeat: no-repeat;
+}
+.piece-film.textured > .piece-etch { display: none; }
+.piece-film.is-dragging { --pc-scale: 1; } /* keep rect math exact while lit */
+.piece-film .piece-etch {
+  transform: none;
+  color: rgba(250, 240, 215, 0.4);
+  filter: blur(1.2px);
+  font-size: 6px;
+}
+.film-lit {
+  position: absolute;
+  inset: 0;
+  clip-path: inset(100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(ellipse at 50% 45%, rgba(255, 246, 222, 0.30) 0 30%, transparent 70%),
+    linear-gradient(165deg, #4d4232, #3a3225);
+  background-size: cover;
+  background-position: center;
+}
+.film-lit-label {
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #fdf3d8;
+  text-shadow:
+    0 0 6px rgba(253, 243, 216, 0.9),
+    0 0 16px rgba(240, 214, 150, 0.7);
+  text-align: center;
+  padding: 0 6px;
+  position: relative;
+  z-index: 1;
+}
+/* faint ribs behind the lit label */
+.film-lit::before {
+  content: "";
+  position: absolute;
+  top: 18px; left: 50%;
+  width: 4px; height: 78px;
+  margin-left: -2px;
+  background: rgba(253, 243, 216, 0.28);
+  border-radius: 2px;
+  box-shadow:
+    -14px 12px 0 -1px rgba(253, 243, 216, 0.18),
+    14px 12px 0 -1px rgba(253, 243, 216, 0.18),
+    -11px 30px 0 -1px rgba(253, 243, 216, 0.15),
+    11px 30px 0 -1px rgba(253, 243, 216, 0.15),
+    -8px 48px 0 -1px rgba(253, 243, 216, 0.12),
+    8px 48px 0 -1px rgba(253, 243, 216, 0.12);
+}
+
+/* Printed hint label — deliberately machine-set (mono small caps), so a
+   printed name never reads like the handwritten clue itself. */
+.hint-label {
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  transform: translateX(-50%) rotate(-2deg);
+  background: #fffdf5;
+  border: 1px solid rgba(36, 31, 20, 0.4);
+  border-radius: 2px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #2b2b33;
+  box-shadow: 0 1px 3px rgba(36, 31, 20, 0.35);
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 2;
+}
+
+/* ── Seeded per-piece variety (paper family) ─────────────────────── */
+
+.piece-skin {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: var(--skin-tex, none);
+  background-size: contain;
+  background-position: center;
+  background-repeat: no-repeat;
+  transform: scaleX(var(--skin-flip, 1)) skew(var(--skin-skew, 0deg));
+  filter: var(--skin-filter, none);
+  pointer-events: none;
+}
+.piece .piece-label { position: relative; z-index: 1; }
+body.has-textures .piece.textured .piece-skin ~ .piece-label { text-shadow: 0 1px 1px rgba(255,255,255,0.35); }
+/* when the skin carries the texture, the piece box itself goes bare */
+body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1; }
+
+.piece-fold {
+  position: absolute;
+  width: 16px; height: 16px;
+  z-index: 2;
+  pointer-events: none;
+  /* a lifted paper corner: lighter backside triangle, thin crease shadow,
+     soft falloff onto the page, so it reads as a dog-ear rather than a
+     floating triangle */
+  background:
+    linear-gradient(315deg,
+      #f8f2e1 0 38%,
+      #e3d9bf 44%,
+      rgba(36, 31, 20, 0.32) 49% 52%,
+      rgba(36, 31, 20, 0.10) 55%,
+      transparent 62%);
+  filter: drop-shadow(-1px 1px 1px rgba(36, 31, 20, 0.22));
+  opacity: 0.95;
+}
+.piece-fold.fold-tl { top: 0; left: 0; transform: rotate(90deg); }
+.piece-fold.fold-tr { top: 0; right: 0; transform: rotate(180deg); }
+.piece-fold.fold-bl { bottom: 0; left: 0; }
+.piece-fold.fold-br { bottom: 0; right: 0; transform: rotate(270deg); }
+.piece-fold.fold-tex {
+  background: var(--tex-fold-1) center / contain no-repeat;
+  filter: none;
+}
+
+.piece-tape {
+  position: absolute;
+  top: -6px;
+  left: var(--tape-x, 50%);
+  width: 34px; height: 13px;
+  z-index: 2;
+  pointer-events: none;
+  transform: translateX(-50%) rotate(var(--tape-rot, 0deg));
+  background: var(--tape-tex, linear-gradient(rgba(250, 246, 228, 0.6), rgba(238, 231, 206, 0.55)));
+  background-size: cover;
+  border: 1px solid rgba(36, 31, 20, 0.08);
+  border-radius: 1px;
+  box-shadow: 0 1px 1px rgba(36, 31, 20, 0.12);
+}
+
+/* ── Photograph (photo) — the image is the clue ──────────────────── */
+
+.piece-photo {
+  --type-scale: var(--scale-photo, 1);
+  width: 94px;
+  height: 110px;
+  background: #fdfcf6;
+  border: 1px solid rgba(36, 31, 20, 0.2);
+  box-shadow: 0 3px 7px rgba(36, 31, 20, 0.28);
+  color: var(--ink);
+  font-size: 0.72rem;
+}
+.photo-window {
+  position: absolute;
+  top: 6px; left: 6px; right: 6px; bottom: 26px;
+  background: linear-gradient(150deg, #b7b1a3, #a49e8f);
+  background-size: cover;
+  background-position: center;
+  z-index: 1;
+}
+.photo-caption {
+  position: absolute;
+  left: 4px; right: 4px; bottom: 4px;
+  text-align: center;
+  z-index: 1;
+}
+
+/* ── Prescription script (rx) ────────────────────────────────────── */
+
+.piece-rx {
+  --type-scale: var(--scale-rx, 1);
+  width: 86px;
+  height: 106px;
+  background: #fcfaf2;
+  border: 1px solid rgba(36, 31, 20, 0.22);
+  border-top: 4px solid rgba(122, 79, 192, 0.45);
+  box-shadow: 0 3px 7px rgba(36, 31, 20, 0.26);
+  color: var(--ink);
+  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 20px 8px 8px;
+}
+.rx-glyph {
+  position: absolute;
+  top: 4px; left: 7px;
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: rgba(122, 79, 192, 0.75);
+  z-index: 1;
+}
+.rx-line { position: relative; z-index: 1; }
+
+/* ── Slide letters (A, B, C… — identifiers, not hints) ───────────── */
+
+.slide-letter {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: rgba(50, 42, 26, 0.75);
+  z-index: 1;
+}
+
+.scope-slide-title {
+  position: absolute;
+  top: 8px; left: 10px;
+  z-index: 2;
+  background: rgba(250, 245, 231, 0.9);
+  border: 1px solid var(--panel-edge);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.scope-slide-title:empty { display: none; }
+
+/* ── Guesses left (the redesigned mistake tracker) ───────────────── */
+
+.guesses {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--r-m);
+  padding: 7px 14px;
+}
+.guesses-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--ink-soft);
+}
+.guesses .pips { display: flex; gap: 8px; }
+.guesses .pip {
+  width: 16px; height: 16px;
+  border: 2.5px solid var(--ink-soft);
+  background: var(--ink-soft);   /* tier-agnostic neutral */
+}
+.guesses .pip.used {
+  background: transparent;
+  border-style: dashed;
+  transform: scale(0.85) rotate(24deg);
+}
+.guesses .pip.just-broke { animation: pip-break 0.5s var(--ease); }
+@keyframes pip-break {
+  0% { transform: scale(1.3); border-style: solid; }
+  55% { transform: scale(0.75) rotate(32deg); }
+  100% { transform: scale(0.85) rotate(24deg); }
+}
+.guesses-count {
+  font-weight: 800;
+  font-size: 1.1rem;
+  color: var(--ink);
+  min-width: 1.1ch;
+  text-align: center;
+}
+.guesses.wrong-feedback { animation: guess-shake 0.45s var(--ease); }
+@keyframes guess-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(6px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(3px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* animations collapse globally — hold a static flash instead */
+  .guesses.wrong-feedback { outline: 3px solid var(--danger); outline-offset: 2px; }
+}
+
+/* ── Toast ───────────────────────────────────────────────────────── */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  background: var(--toast-bg);
+  color: var(--toast-ink);
+  padding: 10px 20px;
+  border-radius: var(--r-m);
+  font-size: 0.9rem;
+  font-weight: 600;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+  z-index: 150;
+  opacity: 0;
+  transition: opacity var(--dur), transform var(--dur) var(--ease);
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+
+/* ── Overlays ────────────────────────────────────────────────────── */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(36, 31, 20, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 100;
+}
+.overlay-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: 14px;
+  padding: 26px 28px;
+  max-width: 560px;
+  width: 100%;
+  max-height: 88vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
+  animation: overlay-in var(--dur) var(--ease);
+}
+@keyframes overlay-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.overlay-card ol { padding-left: 1.2em; display: flex; flex-direction: column; gap: 6px; }
+.overlay-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
+
+.results-card h2 { font-size: 1.5rem; }
+#results-sub { color: var(--ink-soft); margin-bottom: 0.2em; }
+.results-hints { color: var(--ink-soft); font-size: 0.9rem; }
+.results-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 16px 0;
+}
+.result-placard {
+  border: 1px solid var(--panel-edge);
+  border-left: 6px solid var(--group-color, var(--accent));
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--card);
+}
+.result-placard-name {
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--group-color, var(--accent));
+  margin-bottom: 4px;
+}
+.result-placard h3 { font-size: 1.05rem; margin: 0 0 4px; }
+.result-placard-items { font-size: 0.85rem; color: var(--ink-soft); margin: 4px 0; }
+.result-placard-explanation { font-size: 0.88rem; margin: 6px 0 0; }
+.result-placard.solved-by-player .result-placard-name::after {
+  content: " • solved by you";
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+  color: var(--ink-soft);
+}
+
+.results-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+.share-fallback {
+  width: 100%;
+  margin-top: 12px;
+  min-height: 90px;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-edge);
+}
+
+/* ── Error screen ────────────────────────────────────────────────── */
+
+.screen-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.error-card {
+  max-width: 520px;
+  background: var(--panel);
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  padding: 26px 28px;
+  text-align: center;
+}
+.error-message {
+  white-space: pre-wrap;
+  text-align: left;
+  background: rgba(178, 58, 47, 0.08);
+  border-radius: 8px;
+  padding: 12px;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--danger);
+}
+
+/* ══════════════════════ DEV: LAYOUT MODE (?layout) ══════════════════════ */
+
+.layout-panel {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  width: 270px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  background: var(--panel);
+  border: 2px solid var(--accent);
+  border-radius: 12px;
+  padding: 14px 16px;
+  z-index: 200;
+  font-size: 0.85rem;
+}
+.layout-panel h2 { font-size: 1rem; margin-bottom: 2px; }
+.layout-panel .lp-note { color: var(--ink-soft); font-size: 0.78rem; }
+.layout-panel label { display: block; margin: 8px 0 2px; font-weight: 600; font-size: 0.78rem; }
+.layout-panel input[type="range"] { width: 100%; accent-color: var(--accent); }
+.layout-panel .lp-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.layout-panel .btn { font-size: 0.8rem; padding: 0.4em 0.8em; }
+body.layout-mode .machine { cursor: move; outline: 2px dashed rgba(122, 79, 192, 0.6); outline-offset: 3px; }
+
+/* ══════════════════════ DEV: PUZZLE CREATOR (?editor) ══════════════════════ */
+
+/* The live game preview is the whole screen, at true game size — the
+   authoring form floats over it as a collapsible drawer (same slide-away
+   pattern as the ?layout panel: .panel-tab toggles .panel-hidden). */
+.screen-editor {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
+.editor-preview-stage {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: var(--paper);
+}
+.editor-preview-stage iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.editor-drawer {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  width: 400px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  background: var(--panel);
+  border: 2px solid var(--accent);
+  border-radius: 12px;
+  padding: 14px 16px;
+  z-index: 200;
+  transition: transform var(--dur) var(--ease);
+}
+.editor-drawer.panel-hidden { transform: translateX(calc(100% + 20px)); }
+.editor-drawer h1 { font-size: 1.2rem; margin-bottom: 2px; }
+.editor-drawer .editor-sub { color: var(--ink-soft); font-size: 0.78rem; margin-bottom: 12px; }
+
+.editor-topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-start;
+  border: 1px solid var(--panel-edge);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.status-chip {
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  align-self: center;
+}
+.status-chip.ok { background: rgba(79, 107, 69, 0.16); color: #33482c; }
+.status-chip.bad { background: rgba(178, 58, 47, 0.13); color: var(--danger); }
+
+.editor-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.editor-meta label { font-size: 0.72rem; font-weight: 700; color: var(--ink-soft); }
+.screen-editor input[type="text"], .screen-editor input[type="date"],
+.screen-editor select, .screen-editor textarea {
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 5px 8px;
+  border: 1px solid var(--panel-edge);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--ink);
+}
+.screen-editor input[type="color"] {
+  width: 32px; height: 27px;
+  padding: 1px;
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--r-s);
+  background: var(--field-bg);
+}
+
+.machine-toggles { display: flex; gap: 14px; flex-wrap: wrap; }
+.machine-toggle { font-size: 0.82rem; }
+.machine-toggle label { display: flex; gap: 6px; align-items: center; cursor: pointer; font-weight: 600; }
+.machine-toggle input { accent-color: var(--accent); width: 16px; height: 16px; }
+.machine-warn {
+  display: block;
+  color: var(--danger);
+  font-size: 0.7rem;
+  max-width: 190px;
+  margin-top: 2px;
+}
+
+.editor-actions { display: flex; gap: 8px; flex-wrap: wrap; align-self: center; margin-left: auto; }
+.editor-actions .btn { font-size: 0.8rem; padding: 0.45em 0.9em; }
+
+.editor-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.group-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-left: 6px solid var(--gc, var(--accent));
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.group-card .gc-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin-bottom: 6px;
+}
+.group-card .gc-row { display: flex; gap: 8px; margin-bottom: 6px; }
+.group-card .gc-row input[data-gfield="name"] { flex: 1; font-weight: 700; }
+.group-card .gc-row select { width: 88px; }
+.group-card input[data-gfield="explanation"] { width: 100%; margin-bottom: 4px; }
+
+.item-editor {
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-top: 8px;
+  background: var(--slot-bg);
+}
+.item-editor .item-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.item-editor input[data-ifield="label"] { flex: 1; min-width: 110px; }
+.kind-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+.kind-chip {
+  border: 1px solid var(--panel-edge);
+  background: var(--control-bg);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.kind-chip.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+.item-editor details { margin-top: 6px; font-size: 0.75rem; color: var(--ink-soft); }
+.item-editor details summary { cursor: pointer; }
+.item-editor details .adv-row { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
+.item-file { font-size: 0.7rem; max-width: 170px; }
+.field-hint { color: var(--danger); font-size: 0.72rem; margin: 3px 0 0; }
+
+.editor-drawer .preview-note { font-size: 0.72rem; color: var(--ink-soft); margin: 10px 0 0; }
+
+/* the game embedded as a live preview strips its chrome */
+body.preview-mode .play-actions,
+body.preview-mode .play-header-title p { display: none; }
+
+@media (max-width: 640px) {
+  .editor-drawer { width: calc(100vw - 24px); }
+}
+
+/* ── Settings overlay ────────────────────────────────────────────── */
+
+.settings-group {
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--r-m);
+  padding: 12px 14px;
+  margin: 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.settings-group legend {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--ink-soft);
+  padding: 0 6px;
+}
+.settings-dev { border-style: dashed; }
+.settings-dev-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--ink-soft);
+  margin: 0;
+}
+.menu-settings-note { color: var(--ink-soft); font-size: 0.9rem; }
+
+/* ── Dev panel: collapsible sections + slide-away (both editors) ─── */
+
+.layout-panel { border-radius: var(--r-l); transition: transform var(--dur) var(--ease); }
+.layout-panel.panel-hidden { transform: translateX(calc(100% + 20px)); }
+.panel-tab {
+  position: fixed;
+  top: 16px;
+  right: 12px;
+  z-index: 210;
+  writing-mode: vertical-rl;
+  padding: 10px 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: none;
+  border-radius: var(--r-s);
+  cursor: pointer;
+}
+.dev-section { border-top: 1px solid var(--panel-edge); margin-top: 10px; padding-top: 4px; }
+.dev-section > summary {
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+  padding: 6px 0;
+  list-style: none;
+}
+.dev-section > summary::before { content: "▸ "; }
+.dev-section[open] > summary::before { content: "▾ "; }
+.dev-section .cue-row { display: flex; align-items: center; gap: 6px; }
+.dev-section .cue-row .btn { padding: 0.15em 0.5em; font-size: 0.7rem; }
+.dev-section .cue-row input[type="range"] { flex: 1; }
+.dev-section .cue-row .cue-name { font-size: 0.72rem; width: 86px; color: var(--ink-soft); }
+
+.group-card > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.group-card > summary::before { content: "▸ "; }
+.group-card[open] > summary::before { content: "▾ "; }
+
+/* ══════════════════════ RESPONSIVE ══════════════════════ */
+
+@media (max-width: 1100px) {
+  /* squarish laptops: viewer yields width to the desk */
+  .zoom-control { max-width: 240px; }
+}
+
+@media (max-width: 900px) {
+  /* stack: smaller viewer square above the desk; page may scroll */
+  .screen-play { height: auto; overflow: visible; }
+  .play-main { flex-direction: column; }
+  .scope-panel { width: 100%; }
+  .scope-display-wrap { flex: 0 0 auto; aspect-ratio: auto; height: 34vh; max-height: 320px; }
+  .play-area { min-height: 46vh; }
+  .lightbox-screen { width: 200px; height: 130px; }
+}
+
+@media (max-width: 760px) {
+  .trays { grid-template-columns: repeat(2, 1fr); }
+  .scope-stage { width: 92px; height: 92px; }
+  .scope-stage-glass { width: 62px; height: 62px; }
+  .lightbox-screen { width: 150px; height: 105px; }
+  .printer-body { width: 96px; height: 54px; }
+  .play-header { gap: 10px; }
+  .mistake-tracker { margin-left: 0; order: 3; width: 100%; }
+}
+
+/* ══════════════════════ REDUCED MOTION ══════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

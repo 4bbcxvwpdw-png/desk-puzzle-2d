@@ -1,0 +1,16 @@
+{
+  "generated": "GPT Image generation on 2026-07-16; object assets have transparent PNG backgrounds.",
+  "present": [
+    "sticky.png",
+    "sticky-pink.png",
+    "sticky-green.png",
+    "sticky-orange.png",
+    "card.png",
+    "paper.png",
+    "slide.png",
+    "film.png",
+    "desk.jpg",
+    "blotter.png"
+  ],
+  "notes": "The sticky notes, card, paper, slide, and film are natural-looking cutouts with alpha transparency. desk.jpg and blotter.png are intentionally opaque full-frame background textures."
+}

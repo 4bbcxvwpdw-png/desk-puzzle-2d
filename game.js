@@ -1,0 +1,4011 @@
+'use strict';
+
+/* ════════════════════════════════════════════════════════════════════
+ * RULES ENGINE — pure, DOM-free.
+ *
+ * A 4-tray × 4-slot staging grid, independent per-tray Lock In, mistakes,
+ * "one away" detection, and the intro → playing → won|lost phase machine.
+ * Nothing in this section touches the DOM — see "DOM LAYER" further down
+ * for rendering, input, persistence, and sound.
+ * ════════════════════════════════════════════════════════════════════ */
+
+var ZONE_CAPACITY = { corkboard: 6, folder: 5, rack: 6, tubes: 4, deskCards: 4 };
+var MAX_MISTAKES = 4;
+var GROUP_SIZE = 4;
+var BOX_COUNT = 4;
+var SLOT_COUNT = 4;
+
+/** Minimal pub/sub. */
+function Emitter() {
+  this.listeners = Object.create(null);
+}
+Emitter.prototype.on = function (event, fn) {
+  if (!this.listeners[event]) this.listeners[event] = [];
+  this.listeners[event].push(fn);
+  var self = this;
+  return function () { self.off(event, fn); };
+};
+Emitter.prototype.off = function (event, fn) {
+  if (!this.listeners[event]) return;
+  this.listeners[event] = this.listeners[event].filter(function (f) { return f !== fn; });
+};
+Emitter.prototype.emit = function (event, payload) {
+  var fns = this.listeners[event];
+  if (!fns) return;
+  fns.slice().forEach(function (fn) { fn(payload); });
+};
+/** Detach every listener — used when a game instance is replaced. */
+Emitter.prototype.removeAll = function () {
+  this.listeners = Object.create(null);
+};
+
+/* Piece kinds. The ids are legacy zone names kept for old puzzle files;
+   every piece of UI copy uses the friendly names instead. */
+var PIECE_KIND_NAMES = {
+  corkboard: 'sticky note',
+  folder: 'paper sheet',
+  rack: 'slide',
+  tubes: 'X-ray film',
+  photo: 'photograph',
+  rx: 'prescription',
+};
+
+/** Retired piece kinds are mapped forward when a puzzle loads. */
+var KIND_MIGRATIONS = { deskCards: 'folder' };
+
+function normalizeKinds(c) {
+  if (c && Array.isArray(c.items)) {
+    c.items.forEach(function (i) {
+      if (i && KIND_MIGRATIONS[i.zone]) i.zone = KIND_MIGRATIONS[i.zone];
+    });
+  }
+  return c;
+}
+
+/* Machines a puzzle may declare. Absent `machines` field = all three. */
+var ALL_MACHINES = ['scope', 'lightbox', 'printer'];
+
+/** The machine set a puzzle declares (back-compat: absent = everything). */
+function puzzleMachines(c) {
+  if (!c || !Array.isArray(c.machines)) return ALL_MACHINES.slice();
+  return c.machines.filter(function (m) { return ALL_MACHINES.indexOf(m) !== -1; });
+}
+
+/**
+ * Collect every structural problem with a puzzle case (empty = valid).
+ * Checks counts, ids, group coverage, and that every piece kind that
+ * NEEDS a machine to be readable has that machine declared.
+ */
+function caseProblems(c) {
+  var problems = [];
+  if (!c || !Array.isArray(c.items) || c.items.length !== 16) {
+    problems.push('expected 16 items, got ' + (c && c.items ? c.items.length : 0));
+  }
+  if (!c || !Array.isArray(c.groups) || c.groups.length !== 4) {
+    problems.push('expected 4 groups, got ' + (c && c.groups ? c.groups.length : 0));
+  }
+  if (!c || !Array.isArray(c.items) || !Array.isArray(c.groups)) return problems;
+
+  var ids = new Set(c.items.map(function (i) { return i.id; }));
+  if (ids.size !== c.items.length) problems.push('duplicate item ids');
+
+  var grouped = new Set();
+  c.groups.forEach(function (g) {
+    var itemIds = g.itemIds || [];
+    if (itemIds.length !== 4) problems.push('group "' + g.name + '" has ' + itemIds.length + ' items');
+    itemIds.forEach(function (id) {
+      if (!ids.has(id)) problems.push('group "' + g.name + '" references unknown item "' + id + '"');
+      if (grouped.has(id)) problems.push('item "' + id + '" appears in two groups');
+      grouped.add(id);
+    });
+  });
+  if (grouped.size !== 16) problems.push('groups cover ' + grouped.size + '/16 items');
+
+  c.items.forEach(function (i) {
+    if (!PIECE_KIND_NAMES[i.zone]) problems.push('item "' + i.id + '" has unknown piece type "' + i.zone + '"');
+  });
+
+  // Machines cross-check: a slide with no microscope (or a film with no
+  // light box) would be an unreadable clue — that's an invalid puzzle.
+  if (c.machines !== undefined && !Array.isArray(c.machines)) {
+    problems.push('"machines" must be a list (e.g. ["scope","lightbox","printer"])');
+  }
+  var machines = puzzleMachines(c);
+  var hasSlides = c.items.some(function (i) { return i.zone === 'rack'; });
+  var hasFilms = c.items.some(function (i) { return i.zone === 'tubes'; });
+  if (hasSlides && machines.indexOf('scope') === -1) {
+    problems.push('this puzzle has slides but no microscope, so they would be unreadable');
+  }
+  if (hasFilms && machines.indexOf('lightbox') === -1) {
+    problems.push('this puzzle has X-ray films but no light box, so they would be unreadable');
+  }
+  return problems;
+}
+
+/** Throws with a readable message if the case is structurally invalid. */
+function validateCase(c) {
+  var problems = caseProblems(c);
+  if (problems.length) {
+    throw new Error('Invalid puzzle case "' + (c && c.id) + '":\n - ' + problems.join('\n - '));
+  }
+}
+
+/** Find the group an item belongs to. Throws if the item has no group. */
+function groupOfItem(c, itemId) {
+  var g = c.groups.find(function (g) { return g.itemIds.indexOf(itemId) !== -1; });
+  if (!g) throw new Error('item ' + itemId + ' has no group');
+  return g;
+}
+
+/** A fresh 4×4 grid of empty slot cells. */
+function emptyGrid() {
+  var grid = [];
+  for (var b = 0; b < BOX_COUNT; b++) {
+    var row = [];
+    for (var s = 0; s < SLOT_COUNT; s++) row.push(null);
+    grid.push(row);
+  }
+  return grid;
+}
+
+/**
+ * DeskPuzzleGame — the state machine. Phases: intro → playing → won|lost.
+ * `casual` (settable any time) lifts the mistake ceiling to Infinity so a
+ * run never hits 'lost'; mistakes are still counted and shown.
+ */
+function DeskPuzzleGame(puzzle, opts) {
+  opts = opts || {};
+  this.puzzle = puzzle;
+  this.events = new Emitter();
+  this.casual = !!opts.casual;
+
+  this.phase_ = 'intro';
+  this.staging_ = emptyGrid();
+  this.mistakes_ = 0;
+  this.solved_ = [];
+  this.attempts_ = []; // { itemIds: string[4], correct: boolean, boxIndex } — for the share grid
+}
+
+Object.defineProperties(DeskPuzzleGame.prototype, {
+  phase: { get: function () { return this.phase_; } },
+  staging: { get: function () { return this.staging_; } },
+  mistakes: { get: function () { return this.mistakes_; } },
+  maxMistakes: { get: function () { return this.casual ? Infinity : MAX_MISTAKES; } },
+  mistakesLeft: { get: function () { return this.maxMistakes - this.mistakes_; } },
+  solved: { get: function () { return this.solved_; } },
+  attempts: { get: function () { return this.attempts_; } },
+});
+
+DeskPuzzleGame.prototype.isSolvedItem = function (itemId) {
+  var g = groupOfItem(this.puzzle, itemId);
+  return this.solved_.some(function (s) { return s.groupId === g.id; });
+};
+
+/** Box index currently holding this item, or -1. */
+DeskPuzzleGame.prototype.boxOfItem = function (itemId) {
+  return this.staging_.findIndex(function (box) { return box.indexOf(itemId) !== -1; });
+};
+
+/** Slot cell {box, slot} currently holding this item, or null. */
+DeskPuzzleGame.prototype.cellOfItem = function (itemId) {
+  for (var b = 0; b < BOX_COUNT; b++) {
+    var s = this.staging_[b].indexOf(itemId);
+    if (s >= 0) return { box: b, slot: s };
+  }
+  return null;
+};
+
+DeskPuzzleGame.prototype.isStaged = function (itemId) {
+  return this.cellOfItem(itemId) !== null;
+};
+
+DeskPuzzleGame.prototype.isBoxLocked = function (boxIndex) {
+  return this.solved_.some(function (s) { return s.boxIndex === boxIndex; });
+};
+
+/** First empty slot index in a box, or -1. */
+DeskPuzzleGame.prototype.firstEmptySlot = function (boxIndex) {
+  return this.staging_[boxIndex].indexOf(null);
+};
+
+/** Item ids still in play (not solved, not staged) — desk display order. */
+DeskPuzzleGame.prototype.activeItemIds = function () {
+  var self = this;
+  return this.puzzle.items
+    .map(function (i) { return i.id; })
+    .filter(function (id) { return !self.isSolvedItem(id) && !self.isStaged(id); });
+};
+
+DeskPuzzleGame.prototype.setPhase = function (p) {
+  if (this.phase_ === p) return;
+  this.phase_ = p;
+  this.events.emit('phase', p);
+  this.touch();
+};
+
+/**
+ * Put an item into a specific slot cell of box `boxIndex`. If that cell is
+ * taken by another item, fall back to the first empty cell in the box (or
+ * 'full' if none). Moving an already-staged item returns 'moved' (no
+ * 'staged' event); a new item from the desk returns 'staged'.
+ */
+DeskPuzzleGame.prototype.stageToSlot = function (itemId, boxIndex, slotIndex) {
+  if (this.phase_ !== 'playing' || this.isSolvedItem(itemId)) return 'ignored';
+  if (boxIndex < 0 || boxIndex >= BOX_COUNT || this.isBoxLocked(boxIndex)) return 'ignored';
+  if (slotIndex < 0 || slotIndex >= SLOT_COUNT) return 'ignored';
+
+  var from = this.cellOfItem(itemId);
+
+  var target = slotIndex;
+  var occupant = this.staging_[boxIndex][target];
+  if (occupant !== null && occupant !== itemId) {
+    target = this.firstEmptySlot(boxIndex);
+    if (target < 0) return 'full';
+  }
+
+  if (from && from.box === boxIndex && from.slot === target) return 'ignored';
+
+  if (from) {
+    this.staging_[from.box][from.slot] = null;
+    this.staging_[boxIndex][target] = itemId;
+    this.touch();
+    return 'moved';
+  }
+
+  this.staging_[boxIndex][target] = itemId;
+  this.events.emit('staged', { itemId: itemId, boxIndex: boxIndex, slotIndex: target });
+  this.touch();
+  return 'staged';
+};
+
+/** Drop into the first unlocked box that has an empty cell. 'full' if none. */
+DeskPuzzleGame.prototype.autoPlace = function (itemId) {
+  if (this.phase_ !== 'playing' || this.isSolvedItem(itemId)) return 'ignored';
+  for (var b = 0; b < BOX_COUNT; b++) {
+    if (this.isBoxLocked(b)) continue;
+    var slot = this.firstEmptySlot(b);
+    if (slot >= 0) return this.stageToSlot(itemId, b, slot);
+  }
+  return 'full';
+};
+
+/** Send an item from a tray back to the desk. */
+DeskPuzzleGame.prototype.unstage = function (itemId) {
+  var cell = this.cellOfItem(itemId);
+  if (!cell || this.phase_ !== 'playing') return;
+  if (this.isBoxLocked(cell.box) || this.isSolvedItem(itemId)) return;
+  this.staging_[cell.box][cell.slot] = null;
+  this.events.emit('unstaged', { itemId: itemId });
+  this.touch();
+};
+
+/** True when exactly 3 of the 4 guessed items share a single group. */
+DeskPuzzleGame.prototype.isOneAway = function (groups) {
+  var counts = new Map();
+  groups.forEach(function (g) { counts.set(g.id, (counts.get(g.id) || 0) + 1); });
+  var found = false;
+  counts.forEach(function (n) { if (n === 3) found = true; });
+  return found;
+};
+
+/** "Lock In" one staging box as a group guess. */
+DeskPuzzleGame.prototype.submitBox = function (boxIndex) {
+  if (this.phase_ !== 'playing' || this.isBoxLocked(boxIndex)) {
+    return { kind: 'incomplete', boxIndex: boxIndex };
+  }
+  var box = this.staging_[boxIndex];
+  var ids = box.filter(function (c) { return c !== null; });
+  if (ids.length !== GROUP_SIZE) {
+    var r = { kind: 'incomplete', boxIndex: boxIndex };
+    this.events.emit('submit', r);
+    return r;
+  }
+
+  var groups = ids.map(function (id) { return groupOfItem(this.puzzle, id); }, this);
+  var allSame = groups.every(function (g) { return g.id === groups[0].id; });
+
+  var result;
+  if (allSame) {
+    var order = this.solved_.length;
+    this.solved_.push({ groupId: groups[0].id, order: order, boxIndex: boxIndex });
+    this.attempts_.push({ itemIds: ids.slice(), correct: true, boxIndex: boxIndex });
+    result = { kind: 'correct', group: groups[0], order: order, boxIndex: boxIndex };
+  } else {
+    this.mistakes_ += 1;
+    this.attempts_.push({ itemIds: ids.slice(), correct: false, boxIndex: boxIndex });
+    result = {
+      kind: 'wrong',
+      mistakesLeft: this.mistakesLeft,
+      boxIndex: boxIndex,
+      oneAway: this.isOneAway(groups),
+    };
+  }
+  this.events.emit('submit', result);
+
+  if (this.solved_.length === this.puzzle.groups.length) this.setPhase('won');
+  else if (this.mistakes_ >= this.maxMistakes) this.setPhase('lost');
+  else this.touch();
+  return result;
+};
+
+/** Groups not yet solved — shown on the results panel after a loss. */
+DeskPuzzleGame.prototype.unsolvedGroups = function () {
+  var done = new Set(this.solved_.map(function (s) { return s.groupId; }));
+  return this.puzzle.groups.filter(function (g) { return !done.has(g.id); });
+};
+
+DeskPuzzleGame.prototype.snapshot = function () {
+  return {
+    caseId: this.puzzle.id,
+    phase: this.phase_,
+    staging: this.staging_.map(function (box) { return box.slice(); }),
+    mistakes: this.mistakes_,
+    solved: this.solved_.slice(),
+    attempts: this.attempts_.slice(),
+  };
+};
+
+/** Restore a mid-game save. Emits nothing — callers re-sync visuals once. */
+DeskPuzzleGame.prototype.restore = function (s) {
+  if (!s || s.caseId !== this.puzzle.id) return;
+  this.phase_ = s.phase;
+  this.staging_ = s.staging.map(function (box) { return box.slice(); });
+  this.mistakes_ = s.mistakes;
+  this.solved_ = (s.solved || []).slice();
+  this.attempts_ = (s.attempts || []).slice();
+};
+
+DeskPuzzleGame.prototype.reset = function () {
+  this.phase_ = 'intro';
+  this.staging_ = emptyGrid();
+  this.mistakes_ = 0;
+  this.solved_ = [];
+  this.attempts_ = [];
+  this.touch();
+};
+
+DeskPuzzleGame.prototype.touch = function () {
+  this.events.emit('change', this.snapshot());
+};
+
+/* ════════════════════════════════════════════════════════════════════
+ * EMBEDDED FALLBACK PUZZLE — verbatim copy of puzzles/sample-001.json +
+ * puzzles/index.json so the game still works when fetch() fails (e.g.
+ * file://).
+ * ════════════════════════════════════════════════════════════════════ */
+
+var SAMPLE_PUZZLE = {
+  id: 'sample-001',
+  title: 'The Daily Desk',
+  date: '2026-07-07',
+  groups: [
+    {
+      id: 'g-colors',
+      name: 'Colors',
+      tier: 1,
+      explanation: 'Red, blue, yellow, and green are all colors.',
+      itemIds: ['red', 'blue', 'yellow', 'green'],
+    },
+    {
+      id: 'g-chess',
+      name: 'Chess pieces',
+      tier: 2,
+      explanation: 'King, queen, rook, and bishop all move on a chessboard.',
+      itemIds: ['king', 'queen', 'rook', 'bishop'],
+    },
+    {
+      id: 'g-time',
+      name: 'Units of time',
+      tier: 3,
+      explanation: 'A second, a minute, an hour, and a week all measure time.',
+      itemIds: ['second', 'minute', 'hour', 'week'],
+    },
+    {
+      id: 'g-board',
+      name: '___ board',
+      tier: 4,
+      explanation: 'Key, cork, score, and surf can each come before "board".',
+      itemIds: ['key', 'cork', 'score', 'surf'],
+    },
+  ],
+  items: [
+    { id: 'red', label: 'Red', zone: 'corkboard', appearance: { color: '#f6d64a' }, info: { title: 'Red', text: 'A primary color.' } },
+    { id: 'king', label: 'King', zone: 'corkboard', appearance: { color: '#f28ab2' }, info: { title: 'King' } },
+    { id: 'hour', label: 'Hour', zone: 'corkboard', appearance: { color: '#7fc6e8' }, info: { title: 'Hour', text: 'Sixty minutes.' } },
+    { id: 'surf', label: 'Surf', zone: 'corkboard', appearance: { color: '#9bd67d' }, info: { title: 'Surf' } },
+    { id: 'minute', label: 'Minute', zone: 'corkboard', appearance: { color: '#f4a259' }, info: { title: 'Minute' } },
+    { id: 'blue', label: 'Blue', zone: 'folder', info: { title: 'Blue', text: 'A primary color.' } },
+    { id: 'queen', label: 'Queen', zone: 'folder', info: { title: 'Queen' } },
+    { id: 'score', label: 'Score', zone: 'folder', info: { title: 'Score', text: 'Twenty.' } },
+    { id: 'week', label: 'Week', zone: 'folder', info: { title: 'Week' } },
+    { id: 'yellow', label: 'Yellow', zone: 'rack', info: { title: 'Yellow' } },
+    { id: 'rook', label: 'Rook', zone: 'rack', info: { title: 'Rook' } },
+    { id: 'second', label: 'Second', zone: 'rack', info: { title: 'Second' } },
+    { id: 'key', label: 'Key', zone: 'rack', info: { title: 'Key' } },
+    { id: 'green', label: 'Green', zone: 'tubes', info: { title: 'Green', text: 'A secondary color.' } },
+    { id: 'cork', label: 'Cork', zone: 'tubes', info: { title: 'Cork' } },
+    { id: 'bishop', label: 'Bishop', zone: 'folder', info: { title: 'Bishop' } },
+  ],
+};
+
+var SAMPLE_INDEX = {
+  current: 'sample-001',
+  puzzles: [
+    { id: 'sample-001', title: 'The Daily Desk', date: '2026-07-07', file: 'sample-001.json' },
+  ],
+};
+
+/* ════════════════════════════════════════════════════════════════════
+ * DOM LAYER — top-down desk, strewn pile, drag everything.
+ *
+ * EVENT-BINDING RULE (hard): every document/window-level pointer, click,
+ * key, and resize handler is bound EXACTLY ONCE in init(), in the CAPTURE
+ * phase for pointer events, and routes by event target. Pieces carry no
+ * individual listeners; syncs only mutate classes, positions, content.
+ * ════════════════════════════════════════════════════════════════════ */
+
+var SAVE_PREFIX = 'dp2d:';
+var SETTINGS_KEY = SAVE_PREFIX + 'settings';
+var LAYOUT_KEY = SAVE_PREFIX + 'layout';
+var EDITOR_DRAFT_KEY = SAVE_PREFIX + 'editor-draft';
+/* v3 namespace: earlier layouts' saves must never half-restore here. */
+var SAVE_NS = SAVE_PREFIX + 'save3:';
+var LEGACY_SAVE_NS = [SAVE_PREFIX + 'save:', SAVE_PREFIX + 'save2:'];
+
+var HINTS_MAX = 3;
+var TIER_EMOJI = { 1: '🟨', 2: '🟩', 3: '🟪', 4: '🟧' };
+
+var PIECE_CLASS = {
+  corkboard: 'piece-sticky',
+  folder: 'piece-paper',
+  rack: 'piece-slide',
+  tubes: 'piece-film',
+  photo: 'piece-photo',
+  rx: 'piece-rx',
+};
+
+var PIECE_NOUN = {
+  corkboard: 'sticky note',
+  folder: 'paper sheet',
+  rack: 'microscope slide',
+  tubes: 'X-ray film',
+  photo: 'photograph',
+  rx: 'prescription script',
+};
+
+/* Paper-ish kinds share sounds and the seeded visual-variety system. */
+var PAPER_FAMILY = { corkboard: 1, folder: 1, photo: 1, rx: 1 };
+
+var TRAY_NAMES = ['tray A', 'tray B', 'tray C', 'tray D'];
+
+/* Objective stops: displayed name → zoom factor over the base cover fit. */
+var OBJECTIVES = { '4': 1, '10': 2.5, '40': 10 };
+
+/* Dev layout knobs (?layout). Machine anchors are desk-fraction positions. */
+var LAYOUT_DEFAULTS = {
+  scope: { fx: 0.015, fy: 0.03 },
+  lightbox: { fx: 0.72, fy: 0.03, w: 250, h: 150 },
+  printer: { fx: 0.85, fy: 0.82 },
+  scatter: { lo: 0.36, hi: 0.92 },
+  pieceScale: { sticky: 1, paper: 1, slide: 1, film: 1, photo: 1, rx: 1 },
+  scopePanel: { w: 300, h: 240 },
+};
+
+var els = {};
+var trayEls = [];
+var trayHeaderEls = [];
+var slotEls = [];
+var lockBtnEls = [];
+
+var state = {
+  settings: { casual: false, sound: true, theme: 'system', dragAudioWip: false },
+  game: null,
+  pieceEls: {},
+  desk: null, // { pos, rot, z, zTop, scope, labels, hintsUsed }
+  drag: null,
+  toastTimer: null,
+  scopeView: { obj: '4', panX: 0.5, panY: 0.5 },
+  scopeSources: {},   // itemId -> canvas | HTMLImageElement (loaded)
+  scopePanning: null,
+  scopeResizing: null,
+  layout: null,
+  layoutMode: false,
+  layoutDrag: null,
+  textures: null,     // Set of present texture filenames, or null
+  editorDraft: null,
+  filmLightTimer: null,
+};
+
+/* ── Small utilities ─────────────────────────────────────────────── */
+
+function toCamel(id) {
+  return id.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+}
+
+function hashString(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+/** Deterministic PRNG — seeds the initial scatter per puzzle id. */
+function mulberry32(seed) {
+  return function () {
+    seed |= 0;
+    seed = (seed + 0x6D2B79F5) | 0;
+    var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function itemById(id) {
+  return state.game.puzzle.items.find(function (i) { return i.id === id; });
+}
+
+/** Is this machine part of the current puzzle? */
+function hasMachine(m) {
+  return !state.activeMachines || state.activeMachines.indexOf(m) !== -1;
+}
+
+/** A rect no point is ever inside — stands in for absent machines. */
+var NEVER_RECT = { left: -9, top: -9, right: -9, bottom: -9, width: 0, height: 0, cx: -9, cy: -9 };
+
+function fallbackColor(id) {
+  var hue = hashString(id) % 60; // warm band only (reds→yellows), no blue
+  return 'hsl(' + (20 + hue) + ' 65% 78%)';
+}
+
+function downloadJson(filename, data) {
+  var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+}
+
+/* ── Element cache ───────────────────────────────────────────────── */
+
+function cacheEls() {
+  [
+    'screen-menu', 'screen-play', 'screen-error', 'screen-editor', 'live-region', 'toast',
+    'btn-play-today', 'archive-list', 'toggle-casual', 'toggle-sound',
+    'puzzle-title', 'puzzle-date', 'mistake-tracker', 'btn-shuffle', 'btn-help', 'btn-menu',
+    'play-area', 'desk-surface', 'piece-layer', 'trays',
+    'machine-scope', 'scope-stage', 'machine-lightbox', 'lightbox-screen',
+    'machine-printer', 'printer-body', 'printer-count',
+    'scope-panel', 'scope-display-wrap', 'scope-canvas',
+    'zoom-track', 'zoom-knob', 'zoom-label', 'tray-hud',
+    'btn-settings', 'btn-settings-menu', 'btn-mute', 'overlay-settings',
+    'btn-close-settings', 'toggle-drag-wip',
+    'overlay-help', 'btn-close-help',
+    'overlay-results', 'results-title', 'results-sub', 'results-hints', 'results-groups',
+    'btn-share', 'btn-play-again', 'btn-back-menu', 'share-fallback',
+    'error-message', 'btn-error-menu', 'layout-panel',
+  ].forEach(function (id) {
+    els[toCamel(id)] = document.getElementById(id);
+  });
+
+  for (var b = 0; b < BOX_COUNT; b++) {
+    trayEls[b] = document.getElementById('tray-' + b);
+    trayHeaderEls[b] = document.getElementById('tray-header-' + b);
+    lockBtnEls[b] = trayEls[b].querySelector('[data-lock]');
+    slotEls[b] = [];
+    for (var s = 0; s < SLOT_COUNT; s++) {
+      slotEls[b][s] = trayEls[b].querySelector('[data-box="' + b + '"][data-slot="' + s + '"]');
+    }
+  }
+}
+
+/* ── Settings, layout, save persistence ─────────────────────────── */
+
+function loadSettings() {
+  try {
+    var raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      var parsed = JSON.parse(raw);
+      state.settings.casual = !!parsed.casual;
+      state.settings.sound = parsed.sound !== false;
+      if (parsed.theme === 'light' || parsed.theme === 'dark' || parsed.theme === 'system') state.settings.theme = parsed.theme;
+      state.settings.dragAudioWip = parsed.dragAudioWip === true;
+    }
+  } catch (e) { /* corrupt settings — use defaults */ }
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+  } catch (e) { /* storage unavailable */ }
+}
+
+/* ── Theme (light / dark / system) ───────────────────────────────── */
+
+var darkQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+function applyTheme() {
+  var mode = state.settings.theme;
+  var dark = mode === 'dark' || (mode === 'system' && darkQuery && darkQuery.matches);
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+}
+
+function setTheme(mode) {
+  state.settings.theme = mode;
+  saveSettings();
+  applyTheme();
+}
+
+function syncSettingsUi() {
+  // Null-guarded: a stale cached index.html must degrade, not crash init.
+  if (els.toggleCasual) els.toggleCasual.checked = state.settings.casual;
+  if (els.toggleSound) els.toggleSound.checked = state.settings.sound;
+  if (els.toggleDragWip) els.toggleDragWip.checked = state.settings.dragAudioWip;
+  document.querySelectorAll('input[name="theme"]').forEach(function (r) {
+    r.checked = r.value === state.settings.theme;
+  });
+  if (els.btnMute) {
+    els.btnMute.textContent = state.settings.sound ? 'Mute' : 'Muted';
+    els.btnMute.setAttribute('aria-pressed', String(!state.settings.sound));
+  }
+}
+
+var LAYOUT_MERGE_KEYS = ['scope', 'lightbox', 'printer', 'scatter', 'pieceScale', 'scopePanel'];
+
+function mergeLayoutLayer(base, layer) {
+  if (!layer || typeof layer !== 'object') return;
+  LAYOUT_MERGE_KEYS.forEach(function (k) {
+    if (layer[k] && typeof layer[k] === 'object') Object.assign(base[k], layer[k]);
+  });
+  if (layer.sound) base.sound = layer.sound;
+}
+
+/**
+ * Layout precedence, lowest to highest: code defaults < layout.json (a
+ * file dropped next to index.html, published by the ?layout Export
+ * button) < the live localStorage override (?layout edits in THIS
+ * browser). The file fetch is 404-tolerant and silent — most installs
+ * never have one, and that's fine, defaults stand.
+ */
+function loadLayout() {
+  var base = JSON.parse(JSON.stringify(LAYOUT_DEFAULTS));
+  return fetch('layout.json', { cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .catch(function () { return null; })
+    .then(function (fileLayout) {
+      mergeLayoutLayer(base, fileLayout);
+      try {
+        var raw = localStorage.getItem(LAYOUT_KEY);
+        if (raw) mergeLayoutLayer(base, JSON.parse(raw));
+      } catch (e) { /* malformed override — file/defaults stand */ }
+      state.layout = base;
+    });
+}
+
+function persistLayout() {
+  state.layout.sound = collectSoundLayer();
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(state.layout)); } catch (e) { /* ignore */ }
+}
+
+/** Apply layout config to the DOM (machine anchors, piece scales, panel). */
+function applyLayout() {
+  var L = state.layout;
+  var root = document.documentElement;
+  els.machineScope.style.left = (L.scope.fx * 100) + '%';
+  els.machineScope.style.top = (L.scope.fy * 100) + '%';
+  els.machineScope.style.right = 'auto';
+  els.machineLightbox.style.left = (L.lightbox.fx * 100) + '%';
+  els.machineLightbox.style.top = (L.lightbox.fy * 100) + '%';
+  els.machineLightbox.style.right = 'auto';
+  els.lightboxScreen.style.width = L.lightbox.w + 'px';
+  els.lightboxScreen.style.height = L.lightbox.h + 'px';
+  els.machinePrinter.style.left = (L.printer.fx * 100) + '%';
+  els.machinePrinter.style.top = (L.printer.fy * 100) + '%';
+  els.machinePrinter.style.right = 'auto';
+  els.machinePrinter.style.bottom = 'auto';
+  Object.keys(L.pieceScale).forEach(function (t) {
+    root.style.setProperty('--scale-' + t, String(L.pieceScale[t]));
+  });
+}
+
+function saveKey(puzzleId) { return SAVE_NS + puzzleId; }
+
+function persistGame() {
+  if (!state.game || !state.desk || state.previewMode) return;
+  var snap = state.game.snapshot();
+  snap.desk = state.desk;
+  try {
+    localStorage.setItem(saveKey(state.game.puzzle.id), JSON.stringify(snap));
+  } catch (e) { /* storage full/unavailable */ }
+}
+
+function loadSavedGame(puzzleId) {
+  try {
+    var raw = localStorage.getItem(saveKey(puzzleId));
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+/**
+ * HEAL a saved engine snapshot so no save — stale, concurrent, or hand-
+ * edited — can restore an inconsistent game. Invariants enforced:
+ * staging holds only valid, unique item ids; each solved entry's box
+ * contains exactly that group's four items; attempts are well-formed and
+ * at least cover the solved locks; phase is recomputed from solved and
+ * mistakes rather than trusted.
+ */
+function sanitizeEngineSave(saved, puzzle) {
+  if (!saved || saved.caseId !== puzzle.id) return null;
+  var ids = new Set(puzzle.items.map(function (i) { return i.id; }));
+
+  var staging = emptyGrid();
+  var seen = new Set();
+  if (Array.isArray(saved.staging)) {
+    for (var b = 0; b < BOX_COUNT; b++) {
+      for (var s = 0; s < SLOT_COUNT; s++) {
+        var v = saved.staging[b] && saved.staging[b][s];
+        if (typeof v === 'string' && ids.has(v) && !seen.has(v)) {
+          staging[b][s] = v;
+          seen.add(v);
+        }
+      }
+    }
+  }
+
+  var mistakes = (typeof saved.mistakes === 'number' && saved.mistakes >= 0)
+    ? Math.floor(saved.mistakes) : 0;
+
+  var solved = [];
+  (Array.isArray(saved.solved) ? saved.solved : []).forEach(function (e) {
+    if (!e || typeof e.boxIndex !== 'number' || e.boxIndex < 0 || e.boxIndex >= BOX_COUNT) return;
+    var g = puzzle.groups.find(function (g) { return g.id === e.groupId; });
+    if (!g) return;
+    var boxIds = staging[e.boxIndex].filter(function (c) { return c !== null; });
+    var exact = boxIds.length === GROUP_SIZE && g.itemIds.every(function (id) { return boxIds.indexOf(id) !== -1; });
+    var dupe = solved.some(function (s2) { return s2.groupId === g.id || s2.boxIndex === e.boxIndex; });
+    if (exact && !dupe) solved.push({ groupId: g.id, order: solved.length, boxIndex: e.boxIndex });
+  });
+
+  var attempts = [];
+  (Array.isArray(saved.attempts) ? saved.attempts : []).forEach(function (a) {
+    if (a && Array.isArray(a.itemIds) && a.itemIds.length === GROUP_SIZE &&
+        a.itemIds.every(function (id) { return ids.has(id); })) {
+      attempts.push({ itemIds: a.itemIds.slice(), correct: !!a.correct, boxIndex: (a.boxIndex | 0) });
+    }
+  });
+  // Every solved lock must appear in the share history.
+  var correct = attempts.filter(function (a) { return a.correct; }).length;
+  if (correct < solved.length) {
+    solved.slice(correct).forEach(function (e) {
+      var g = puzzle.groups.find(function (g) { return g.id === e.groupId; });
+      attempts.push({ itemIds: g.itemIds.slice(), correct: true, boxIndex: e.boxIndex });
+    });
+  }
+
+  var phase = solved.length === puzzle.groups.length
+    ? 'won'
+    : (!state.settings.casual && mistakes >= MAX_MISTAKES ? 'lost' : 'playing');
+
+  return { caseId: puzzle.id, phase: phase, staging: staging, mistakes: mistakes, solved: solved, attempts: attempts, desk: saved.desk };
+}
+
+/* ── Desk state: scatter + healed restore ────────────────────────── */
+
+function scatterSpot(rng) {
+  var sc = state.layout.scatter;
+  return {
+    fx: 0.08 + 0.84 * rng(),
+    fy: sc.lo + (sc.hi - sc.lo) * rng(),
+  };
+}
+
+function freshDeskState(puzzle) {
+  var rng = mulberry32(hashString(puzzle.id));
+  var desk = { pos: {}, rot: {}, z: {}, zTop: 0, scope: null, labels: {}, hintsUsed: 0 };
+  puzzle.items.forEach(function (item) {
+    desk.pos[item.id] = scatterSpot(rng);
+    desk.rot[item.id] = item.zone === 'tubes' ? 0 : -15 + 30 * rng();
+    desk.z[item.id] = ++desk.zTop;
+  });
+  return desk;
+}
+
+/** Validate a saved desk block; fill gaps from a fresh scatter. */
+function restoreDeskState(saved, puzzle, game) {
+  var fresh = freshDeskState(puzzle);
+  var d = saved && saved.desk;
+  if (!d || typeof d !== 'object') return fresh;
+  var desk = { pos: {}, rot: {}, z: {}, zTop: 0, scope: null, labels: {}, hintsUsed: 0 };
+  puzzle.items.forEach(function (item) {
+    var p = d.pos && d.pos[item.id];
+    desk.pos[item.id] = (p && isFinite(p.fx) && isFinite(p.fy))
+      ? { fx: clamp(p.fx, 0, 1), fy: clamp(p.fy, 0, 1) }
+      : fresh.pos[item.id];
+    var r = d.rot && d.rot[item.id];
+    desk.rot[item.id] = item.zone === 'tubes' ? 0 : (isFinite(r) ? r : fresh.rot[item.id]);
+    var z = d.z && d.z[item.id];
+    desk.z[item.id] = isFinite(z) && z > 0 ? Math.floor(z) : fresh.z[item.id];
+    desk.zTop = Math.max(desk.zTop, desk.z[item.id]);
+    if (d.labels && d.labels[item.id] === true) desk.labels[item.id] = true;
+  });
+  // The scope may only hold an undocked rack item.
+  if (typeof d.scope === 'string') {
+    var it = puzzle.items.find(function (i) { return i.id === d.scope; });
+    if (it && it.zone === 'rack' && !game.isStaged(d.scope)) desk.scope = d.scope;
+  }
+  var labelCount = Object.keys(desk.labels).length;
+  desk.hintsUsed = Math.max(
+    labelCount,
+    (typeof d.hintsUsed === 'number' && d.hintsUsed >= 0) ? Math.floor(d.hintsUsed) : 0
+  );
+  return desk;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * SOUND — procedural WebAudio synthesis, file-overridable.
+ *
+ * Every cue is synthesized (no downloads). If assets/sounds/manifest.json
+ * lists a file for a cue name, that file is fetched, decoded, and played
+ * instead. All per-event tuning lives in SOUND_TUNING below.
+ * ════════════════════════════════════════════════════════════════════ */
+
+var SOUND_TUNING = {
+  master: 0.5,             // master gain — everything stays well under 0dBFS
+  'pickup-paper': { synth: 'noise', dur: 0.06, hp: 1400, lp: 6500, gain: 0.14, attack: 0.004 },
+  'drop-paper':   { synth: 'noise', dur: 0.11, hp: 900, lp: 5200, gain: 0.22, attack: 0.006 },
+  'film-rustle':  { synth: 'noise', dur: 0.13, hp: 320, lp: 2100, gain: 0.22, attack: 0.01 },
+  'pickup-glass': { synth: 'partials', freqs: [2960, 4230], dur: 0.05, gain: 0.14 },
+  'drop-glass':   { synth: 'partials', freqs: [2210, 3320], dur: 0.07, gain: 0.16 },
+  'dock-glass':   { synth: 'partials', freqs: [1370, 2060], dur: 0.1, gain: 0.17 },
+  'dial-tick':    { synth: 'tick', freq: 1800, dur: 0.028, gain: 0.2 },
+  'pan-tick':     { synth: 'tick', freq: 1250, dur: 0.02, gain: 0.1 },
+  'print':        { synth: 'print', dur: 0.45, gain: 0.16 },
+  /* "Scatter" cue — a layered paper riffle, not a click: 4-6 overlapping
+     rustle bursts staggered 30-80ms apart with a slight pitch spread,
+     landing around 400-600ms total with a quiet tail (later bursts fade). */
+  'shuffle':      { synth: 'shuffle', bursts: 6, staggerLo: 0.04, staggerHi: 0.08,
+                     durLo: 0.13, durHi: 0.2, hpLo: 650, hpHi: 1150, lpLo: 3600, lpHi: 6200,
+                     rateLo: 0.92, rateHi: 1.14, tailFalloff: 0.6, gain: 0.22 },
+  'correct':      { synth: 'notes', freqs: [392, 523.25], noteDur: 0.16, gain: 0.2 },
+  'wrong':        { synth: 'thud', freq: 108, dur: 0.24, gain: 0.34 },
+  'wrong-crack':  { synth: 'noise', dur: 0.09, hp: 2400, lp: 9000, gain: 0.2, attack: 0.002 },
+  'one-away':     { synth: 'notes', freqs: [440], noteDur: 0.1, gain: 0.12 },
+  'win':          { synth: 'notes', freqs: [392, 494, 587, 784], noteDur: 0.15, gain: 0.18 },
+  'lose':         { synth: 'notes', freqs: [330, 262], noteDur: 0.22, gain: 0.16 },
+
+  /* DEFAULT drag sound (research brief, Option A): distance-quantized
+     scrape grains behind a speed-hysteresis gate. Silent at rest/hold;
+     slow drags tick sparsely; fast slides fuse into a scrape. */
+  scrape: {
+    vOn: 250,        // px/s: gate opens
+    vOff: 110,       // px/s: gate closes (hysteresis ~2:1)
+    emaAlpha: 0.4,   // pointer-speed smoothing
+    grainPx: 90,     // one grain per this many px of travel
+    cooldownMs: 55,  // floor between grains
+    gainLo: 0.35,    // grain gain at the gate
+    gainHi: 1.0,     // grain gain at vRef
+    vRef: 1400,      // px/s that reaches gainHi (sqrt curve)
+    pitchLo: 0.89,   // ±2 semitones max
+    pitchHi: 1.12,
+    volJitterDb: 2.5,
+    settleTick: true, // one soft tick on release after real motion
+    materials: {
+      paper: { hp: 1300, lp: 7000, dur: 0.045, gain: 0.09 },
+      slide: { tick: true, freq: 2600, dur: 0.02, gain: 0.05 },
+      film:  { hp: 300, lp: 1700, dur: 0.065, gain: 0.11 },
+    },
+  },
+
+  /* WIP drag sound (dev toggle): the round-5 velocity bed + travel grains,
+     kept for comparison, with hysteresis + envelopes + speed→lowpass. */
+  dragBed: {
+    paper: { hp: 900, lp: 5200, maxGain: 0.09, speedRef: 900 },
+    slide: { hp: 2200, lp: 7000, maxGain: 0.03, speedRef: 1100 },
+    film:  { hp: 240, lp: 1700, maxGain: 0.11, speedRef: 800 },
+  },
+  dragGrain: {
+    paper: { everyPx: 46, dur: 0.045, hp: 1300, lp: 7000, gain: 0.09 },
+    slide: { everyPx: 95, tick: true, freq: 2600, dur: 0.02, gain: 0.05 },
+    film:  { everyPx: 58, dur: 0.07, hp: 280, lp: 1600, gain: 0.11 },
+    capPerSec: 16,
+    turnBoost: 1.8,
+    turnDot: 0.25,
+  },
+};
+
+var SOUND_DEFAULTS = JSON.parse(JSON.stringify(SOUND_TUNING));
+
+var audio = { ctx: null, master: null, buffers: {}, fileList: null, noise: null };
+
+function audioCtx() {
+  if (!state.settings.sound) return null;
+  if (!audio.ctx) {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    audio.ctx = new Ctx();
+    audio.master = audio.ctx.createGain();
+    audio.master.gain.value = SOUND_TUNING.master;
+    audio.master.connect(audio.ctx.destination);
+  }
+  if (audio.ctx.state === 'suspended') audio.ctx.resume();
+  return audio.ctx;
+}
+
+/** One shared 1s noise buffer, built lazily. */
+function noiseBuffer(ctx) {
+  if (!audio.noise) {
+    audio.noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    var data = audio.noise.getChannelData(0);
+    for (var i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  }
+  return audio.noise;
+}
+
+function envGain(ctx, start, peak, attack, dur) {
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, start);
+  g.gain.linearRampToValueAtTime(peak, start + (attack || 0.005));
+  g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  g.connect(audio.master);
+  return g;
+}
+
+function synthNoise(ctx, t, o, when) {
+  var src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  src.playbackRate.value = o.rate || (0.9 + Math.random() * 0.25);
+  var hp = ctx.createBiquadFilter();
+  hp.type = 'highpass'; hp.frequency.value = o.hp;
+  var lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = o.lp;
+  var start = when || t;
+  src.connect(hp).connect(lp).connect(envGain(ctx, start, o.gain, o.attack, o.dur));
+  src.start(start, Math.random() * 0.4, o.dur + 0.05);
+}
+
+function synthPartials(ctx, t, o) {
+  o.freqs.forEach(function (f, i) {
+    var osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = f * (1 + (Math.random() - 0.5) * 0.01);
+    osc.connect(envGain(ctx, t, o.gain / (i + 1), 0.002, o.dur * (1 + i * 0.3)));
+    osc.start(t);
+    osc.stop(t + o.dur * 2 + 0.05);
+  });
+}
+
+function synthTick(ctx, t, o) {
+  var osc = ctx.createOscillator();
+  osc.type = 'square';
+  osc.frequency.value = o.freq;
+  osc.connect(envGain(ctx, t, o.gain, 0.001, o.dur));
+  osc.start(t);
+  osc.stop(t + o.dur + 0.02);
+}
+
+function synthNotes(ctx, t, o) {
+  o.freqs.forEach(function (f, i) {
+    var osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.value = f;
+    var start = t + i * o.noteDur * 0.85;
+    osc.connect(envGain(ctx, start, o.gain, 0.01, o.noteDur));
+    osc.start(start);
+    osc.stop(start + o.noteDur + 0.05);
+  });
+}
+
+function synthThud(ctx, t, o) {
+  var osc = ctx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(o.freq * 1.6, t);
+  osc.frequency.exponentialRampToValueAtTime(o.freq, t + o.dur * 0.5);
+  osc.connect(envGain(ctx, t, o.gain, 0.004, o.dur));
+  osc.start(t);
+  osc.stop(t + o.dur + 0.05);
+  synthNoise(ctx, t, { hp: 80, lp: 500, gain: o.gain * 0.4, attack: 0.004, dur: o.dur * 0.5 });
+}
+
+function synthPrint(ctx, t, o) {
+  // whirr: band-limited noise with a 30Hz amplitude wobble
+  var src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  var bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass'; bp.frequency.value = 1900; bp.Q.value = 2.2;
+  var g = envGain(ctx, t, o.gain, 0.02, o.dur);
+  var lfo = ctx.createOscillator();
+  lfo.frequency.value = 30;
+  var lfoGain = ctx.createGain();
+  lfoGain.gain.value = o.gain * 0.5;
+  lfo.connect(lfoGain).connect(g.gain);
+  lfo.start(t); lfo.stop(t + o.dur);
+  src.connect(bp).connect(g);
+  src.start(t, 0.1, o.dur);
+  // paper-out flick at the end
+  synthNoise(ctx, t, { hp: 1800, lp: 7000, gain: o.gain * 0.9, attack: 0.003, dur: 0.05 }, t + o.dur * 0.92);
+}
+
+/** "Scatter" cue: a paper riffle — several overlapping rustle grains
+ *  staggered by a random gap each, each with its own pitch/tone jitter,
+ *  fading out toward a quiet tail rather than four evenly-clicking beats. */
+function synthShuffle(ctx, t, o) {
+  var bursts = o.bursts || 5;
+  var cursor = 0;
+  for (var i = 0; i < bursts; i++) {
+    if (i > 0) cursor += o.staggerLo + Math.random() * (o.staggerHi - o.staggerLo);
+    var frac = bursts > 1 ? i / (bursts - 1) : 0;
+    var tail = 1 - frac * (o.tailFalloff || 0);
+    synthNoise(ctx, t, {
+      hp: o.hpLo + Math.random() * (o.hpHi - o.hpLo),
+      lp: o.lpLo + Math.random() * (o.lpHi - o.lpLo),
+      dur: o.durLo + Math.random() * (o.durHi - o.durLo),
+      rate: o.rateLo + Math.random() * (o.rateHi - o.rateLo),
+      gain: o.gain * tail * (0.8 + Math.random() * 0.3),
+      attack: 0.006 + Math.random() * 0.012,
+    }, t + cursor);
+  }
+}
+
+/** Load assets/sounds/manifest.json once; fetch listed override files. */
+function loadSoundOverrides() {
+  fetch('assets/sounds/manifest.json', { cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : { present: [] }; })
+    .then(function (m) {
+      audio.fileList = {};
+      (m.present || []).forEach(function (f) {
+        var name = f.replace(/\.(mp3|wav|ogg)$/i, '');
+        if (SOUND_TUNING[name]) audio.fileList[name] = 'assets/sounds/' + f;
+      });
+    })
+    .catch(function () { audio.fileList = {}; });
+}
+
+function playFileCue(ctx, name, url) {
+  if (audio.buffers[name]) {
+    var src = ctx.createBufferSource();
+    src.buffer = audio.buffers[name];
+    src.connect(audio.master);
+    src.start();
+    return;
+  }
+  fetch(url).then(function (r) { return r.arrayBuffer(); }).then(function (ab) {
+    return ctx.decodeAudioData(ab);
+  }).then(function (buf) {
+    audio.buffers[name] = buf;
+    var src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audio.master);
+    src.start();
+  }).catch(function () { /* fall back silently next call */ });
+}
+
+function playSound(name) {
+  var o = SOUND_TUNING[name];
+  if (!o) return;
+  var ctx = audioCtx();
+  if (!ctx) return;
+  if (audio.fileList && audio.fileList[name]) {
+    playFileCue(ctx, name, audio.fileList[name]);
+    return;
+  }
+  var t = ctx.currentTime + 0.001;
+  switch (o.synth) {
+    case 'noise': synthNoise(ctx, t, o); break;
+    case 'partials': synthPartials(ctx, t, o); break;
+    case 'tick': synthTick(ctx, t, o); break;
+    case 'notes': synthNotes(ctx, t, o); break;
+    case 'thud': synthThud(ctx, t, o); break;
+    case 'print': synthPrint(ctx, t, o); break;
+    case 'shuffle': synthShuffle(ctx, t, o); break;
+  }
+}
+
+/** Pickup/drop cue routed by the piece's physical material. */
+function pieceSound(zone, kind) {
+  if (zone === 'rack') playSound(kind === 'pickup' ? 'pickup-glass' : 'drop-glass');
+  else if (zone === 'tubes') playSound('film-rustle');
+  else playSound(kind === 'pickup' ? 'pickup-paper' : 'drop-paper');
+}
+
+/* ── Drag sound dispatch: default = scrape grains; WIP toggle = bed ── */
+
+function startPieceDrag(zone, x, y) {
+  if (state.settings.dragAudioWip) startDragAudio(zone, x, y);
+  else startScrape(zone, x, y);
+}
+function movePieceDrag(x, y) {
+  if (state.settings.dragAudioWip) dragAudioMove(x, y);
+  else scrapeMove(x, y);
+}
+function stopPieceDrag() {
+  stopDragAudio();
+  stopScrape();
+}
+
+/* ── DEFAULT: distance-quantized scrape grains with hysteresis gate ── */
+
+var scrape = { s: null };
+
+function startScrape(zone, x, y) {
+  stopScrape();
+  var ctx = audioCtx();
+  if (!ctx) return;
+  scrape.s = {
+    mat: dragMaterial(zone),
+    ema: 0, moving: false, moved: false,
+    dist: 0, lastX: x, lastY: y, lastT: ctx.currentTime,
+    lastGrain: 0, lastVariant: -1,
+  };
+  state.scrapeStats = { grains: 0, gateOpens: 0, material: scrape.s.mat };
+}
+
+/* four subtle procedural variants per material, rotated no-immediate-repeat */
+var SCRAPE_VARIANTS = [
+  { hpMul: 1.0, durMul: 1.0 },
+  { hpMul: 0.85, durMul: 1.15 },
+  { hpMul: 1.18, durMul: 0.85 },
+  { hpMul: 1.05, durMul: 1.05 },
+];
+
+function scrapeMove(x, y) {
+  var s = scrape.s;
+  var ctx = audio.ctx;
+  if (!s || !ctx) return;
+  var cfg = SOUND_TUNING.scrape;
+  var now = ctx.currentTime;
+  var dt = Math.max(0.004, now - s.lastT);
+  var dx = x - s.lastX, dy = y - s.lastY;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  var speed = dist / dt;
+  s.ema = s.ema * (1 - cfg.emaAlpha) + speed * cfg.emaAlpha;
+  s.lastX = x; s.lastY = y; s.lastT = now;
+
+  // hysteresis gate
+  if (!s.moving && s.ema > cfg.vOn) {
+    s.moving = true;
+    s.moved = true;
+    if (state.scrapeStats) state.scrapeStats.gateOpens++;
+  } else if (s.moving && s.ema < cfg.vOff) {
+    s.moving = false;
+    s.dist = 0; // micro-adjustments never bank distance
+  }
+  if (!s.moving) return; // total silence below the gate
+
+  s.dist += dist;
+  if (s.dist < cfg.grainPx) return;
+  if ((now - s.lastGrain) * 1000 < cfg.cooldownMs) { s.dist = cfg.grainPx; return; }
+  s.dist -= cfg.grainPx;
+  s.lastGrain = now;
+  fireScrapeGrain(ctx, now, s, cfg);
+  if (state.scrapeStats) state.scrapeStats.grains++;
+}
+
+function fireScrapeGrain(ctx, now, s, cfg) {
+  var mat = SOUND_TUNING.scrape.materials[s.mat];
+  // speed→gain: sqrt curve from the gate to vRef
+  var t = clamp((s.ema - cfg.vOff) / (cfg.vRef - cfg.vOff), 0, 1);
+  var speedGain = cfg.gainLo + (cfg.gainHi - cfg.gainLo) * Math.sqrt(t);
+  // small randomization: ±volJitterDb, pitch within [pitchLo, pitchHi]
+  var vol = Math.pow(10, ((Math.random() * 2 - 1) * cfg.volJitterDb) / 20);
+  var rate = cfg.pitchLo + Math.random() * (cfg.pitchHi - cfg.pitchLo);
+  // rotate variants, never the same twice in a row
+  var vi = Math.floor(Math.random() * SCRAPE_VARIANTS.length);
+  if (vi === s.lastVariant) vi = (vi + 1) % SCRAPE_VARIANTS.length;
+  s.lastVariant = vi;
+  var v = SCRAPE_VARIANTS[vi];
+  if (mat.tick) {
+    synthTick(ctx, now, { freq: mat.freq * rate, dur: mat.dur * v.durMul, gain: mat.gain * speedGain * vol });
+  } else {
+    synthNoise(ctx, now, {
+      hp: mat.hp * v.hpMul, lp: mat.lp,
+      dur: mat.dur * v.durMul,
+      gain: mat.gain * speedGain * vol,
+      attack: 0.003,
+      rate: rate,
+    });
+  }
+}
+
+function stopScrape() {
+  var s = scrape.s;
+  scrape.s = null;
+  if (!s || !audio.ctx) return;
+  // optional soft settle tick, only after real motion
+  if (s.moved && SOUND_TUNING.scrape.settleTick) {
+    var mat = SOUND_TUNING.scrape.materials[s.mat];
+    if (!mat.tick) synthNoise(audio.ctx, audio.ctx.currentTime, { hp: mat.hp * 0.7, lp: mat.lp, dur: 0.04, gain: mat.gain * 0.35, attack: 0.004 });
+  }
+}
+
+/* ── WIP: round-5 bed + travel grains (behind the dev toggle) ────── */
+
+var dragAudio = { session: null };
+
+function dragMaterial(zone) {
+  return zone === 'rack' ? 'slide' : zone === 'tubes' ? 'film' : 'paper';
+}
+
+function startDragAudio(zone, x, y) {
+  stopDragAudio();
+  var ctx = audioCtx();
+  if (!ctx) return;
+  var mat = dragMaterial(zone);
+  var bedCfg = SOUND_TUNING.dragBed[mat];
+  var srcNode = ctx.createBufferSource();
+  srcNode.buffer = noiseBuffer(ctx);
+  srcNode.loop = true;
+  var hp = ctx.createBiquadFilter();
+  hp.type = 'highpass'; hp.frequency.value = bedCfg.hp;
+  var lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = bedCfg.lp;
+  var g = ctx.createGain();
+  g.gain.value = 0;
+  srcNode.connect(hp).connect(lp).connect(g).connect(audio.master);
+  srcNode.start();
+  dragAudio.session = {
+    mat: mat, src: srcNode, gain: g, lp: lp,
+    lastX: x, lastY: y, lastT: ctx.currentTime,
+    speed: 0, distAccum: 0, dirX: 0, dirY: 0,
+    grainTimes: [], gateOpen: false,
+  };
+  // instrumentation (acceptance-checkable):
+  state.dragAudioStats = { grains: 0, turnGrains: 0, bedPeak: 0, material: mat };
+}
+
+function dragAudioMove(x, y) {
+  var s = dragAudio.session;
+  var ctx = audio.ctx;
+  if (!s || !ctx) return;
+  var now = ctx.currentTime;
+  var dt = Math.max(0.004, now - s.lastT);
+  var dx = x - s.lastX, dy = y - s.lastY;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  var speed = dist / dt; // px/s
+  s.speed = s.speed * 0.75 + speed * 0.25; // smoothed
+  var bedCfg = SOUND_TUNING.dragBed[s.mat];
+  // hysteresis gate (research brief Option B): hard zero below the gate
+  var sc = SOUND_TUNING.scrape;
+  if (!s.gateOpen && s.speed > sc.vOn) s.gateOpen = true;
+  else if (s.gateOpen && s.speed < sc.vOff) s.gateOpen = false;
+  var target = s.gateOpen
+    ? Math.min(bedCfg.maxGain, bedCfg.maxGain * (s.speed / bedCfg.speedRef))
+    : 0;
+  // 25ms attack, 120ms release
+  s.gain.gain.setTargetAtTime(target, now, target > s.gain.gain.value ? 0.025 : 0.12);
+  // speed→brightness: lowpass opens with velocity
+  s.lp.frequency.setTargetAtTime(
+    bedCfg.lp * (0.4 + 0.6 * Math.min(1, s.speed / bedCfg.speedRef)), now, 0.08);
+  if (state.dragAudioStats && target > state.dragAudioStats.bedPeak) state.dragAudioStats.bedPeak = target;
+
+  // direction-change accent
+  var turn = false;
+  if (dist > 2) {
+    var nx = dx / dist, ny = dy / dist;
+    if (s.dirX || s.dirY) {
+      var dot = nx * s.dirX + ny * s.dirY;
+      if (dot < SOUND_TUNING.dragGrain.turnDot && s.speed > 240) turn = true;
+    }
+    s.dirX = nx; s.dirY = ny;
+  }
+
+  // travel-distance grains, density-capped
+  s.distAccum += dist;
+  var gcfg = SOUND_TUNING.dragGrain[s.mat];
+  s.grainTimes = s.grainTimes.filter(function (t) { return now - t < 1; });
+  while ((s.distAccum >= gcfg.everyPx || turn) && s.grainTimes.length < SOUND_TUNING.dragGrain.capPerSec) {
+    var boost = turn ? SOUND_TUNING.dragGrain.turnBoost : 1;
+    fireDragGrain(ctx, now, gcfg, boost);
+    s.grainTimes.push(now);
+    if (state.dragAudioStats) {
+      state.dragAudioStats.grains++;
+      if (turn) state.dragAudioStats.turnGrains++;
+    }
+    if (turn) { turn = false; } else { s.distAccum -= gcfg.everyPx; }
+  }
+  if (s.distAccum >= gcfg.everyPx) s.distAccum = gcfg.everyPx; // capped backlog
+
+  s.lastX = x; s.lastY = y; s.lastT = now;
+}
+
+function fireDragGrain(ctx, now, gcfg, boost) {
+  var jitter = 0.7 + Math.random() * 0.6;
+  if (gcfg.tick) {
+    synthTick(ctx, now, { freq: gcfg.freq * (0.9 + Math.random() * 0.2), dur: gcfg.dur, gain: gcfg.gain * jitter * boost });
+  } else {
+    synthNoise(ctx, now, { hp: gcfg.hp * (0.85 + Math.random() * 0.3), lp: gcfg.lp, dur: gcfg.dur * jitter, gain: gcfg.gain * jitter * boost, attack: 0.003 });
+  }
+}
+
+function stopDragAudio() {
+  var s = dragAudio.session;
+  if (!s) return;
+  dragAudio.session = null;
+  var ctx = audio.ctx;
+  if (!ctx) return;
+  try {
+    s.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.03);
+    s.src.stop(ctx.currentTime + 0.15);
+  } catch (e) { /* already stopped */ }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * TEXTURES — skeuomorphic pass, auto-detected.
+ * No manifest, no registration step: drop a file with one of the known
+ * names into assets/textures/ and it's used on the next load. Each name
+ * is probed with an Image(); a missing file just keeps the CSS-drawn
+ * look for that piece type (onerror is swallowed, nothing throws).
+ * ════════════════════════════════════════════════════════════════════ */
+
+var TEXTURE_VARS = {
+  'desk.jpg': '--tex-desk',
+  'sticky.png': '--tex-sticky',
+  'sticky-pink.png': '--tex-sticky-pink',
+  'sticky-green.png': '--tex-sticky-green',
+  'sticky-orange.png': '--tex-sticky-orange',
+  'sticky-2.png': '--tex-sticky-2',
+  'sticky-3.png': '--tex-sticky-3',
+  'paper.png': '--tex-paper',
+  'paper-2.png': '--tex-paper-2',
+  'slide.png': '--tex-slide',
+  'film.png': '--tex-film',
+  'photo.png': '--tex-photo',
+  'photo-2.png': '--tex-photo-2',
+  'rx.png': '--tex-rx',
+  'rx-2.png': '--tex-rx-2',
+  'overlays/tape-1.png': '--tex-tape-1',
+  'overlays/tape-2.png': '--tex-tape-2',
+  'overlays/fold-1.png': '--tex-fold-1',
+};
+
+/* Numbered alternates the per-piece seed may pick from (when present). */
+var TEXTURE_VARIANTS = {
+  corkboard: ['sticky.png', 'sticky-2.png', 'sticky-3.png'],
+  folder: ['paper.png', 'paper-2.png'],
+  photo: ['photo.png', 'photo-2.png'],
+  rx: ['rx.png', 'rx-2.png'],
+};
+
+/**
+ * Runtime alpha-trim: whatever margins or resolution a dropped file has,
+ * only its non-transparent bounding box becomes the effective texture, so
+ * every piece renders at the standardized per-type size. Returns the
+ * trimmed bounding box's own dimensions too (even when no crop was
+ * needed) so callers can reason about the texture's real aspect ratio —
+ * `background-size: contain` letterboxes whenever that ratio doesn't match
+ * the piece's CSS box, and the light box needs to know exactly where that
+ * letterboxing falls (see updateFilmLighting).
+ */
+function alphaTrimInfo(img) {
+  try {
+    var w = img.naturalWidth, h = img.naturalHeight;
+    if (!w || !h || w * h > 4096 * 4096) return null;
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    var d = ctx.getImageData(0, 0, w, h).data;
+    var minX = w, minY = h, maxX = -1, maxY = -1;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (d[(y * w + x) * 4 + 3] > 16) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null; // fully transparent
+    var tw = maxX - minX + 1, th = maxY - minY + 1;
+    var url = null;
+    if (tw !== w || th !== h) {
+      var out = document.createElement('canvas');
+      out.width = tw; out.height = th;
+      out.getContext('2d').drawImage(c, minX, minY, tw, th, 0, 0, tw, th);
+      url = out.toDataURL('image/png');
+    }
+    return { url: url, w: tw, h: th };
+  } catch (e) {
+    return null; // tainted/failed — use the file as-is
+  }
+}
+
+function loadTextures() {
+  var root = document.documentElement;
+  state.textureAspect = state.textureAspect || {};
+  Object.keys(TEXTURE_VARS).forEach(function (f) {
+    var img = new Image();
+    img.onload = function () {
+      if (!state.textures) state.textures = new Set();
+      state.textures.add(f);
+      var url = 'url("assets/textures/' + f + '")';
+      if (f !== 'desk.jpg') { // opaque full-frame backgrounds skip the trim
+        var info = alphaTrimInfo(img);
+        if (info) {
+          if (info.url) url = 'url("' + info.url + '")';
+          state.textureAspect[f] = info.w / info.h;
+        }
+      }
+      root.style.setProperty(TEXTURE_VARS[f], url);
+      document.body.classList.add('has-textures');
+      if (f === 'desk.jpg') els.deskSurface.classList.add('textured');
+      if (state.game) syncPieces();
+    };
+    img.onerror = function () { /* not present — CSS look stands for this slot */ };
+    img.src = 'assets/textures/' + f;
+  });
+}
+
+/** Sticky color variant for an authored color (hue-matched). */
+function stickyColorVariant(color) {
+  var pick = 'sticky.png';
+  if (color) {
+    var c = color.replace('#', '');
+    if (c.length === 3) c = c.replace(/(.)/g, '$1$1');
+    var r = parseInt(c.slice(0, 2), 16), g = parseInt(c.slice(2, 4), 16), bch = parseInt(c.slice(4, 6), 16);
+    if (!isNaN(r)) {
+      var mx = Math.max(r, g, bch), mn = Math.min(r, g, bch);
+      var hue = 0;
+      if (mx !== mn) {
+        if (mx === r) hue = ((g - bch) / (mx - mn)) % 6;
+        else if (mx === g) hue = (bch - r) / (mx - mn) + 2;
+        else hue = (r - g) / (mx - mn) + 4;
+        hue = (hue * 60 + 360) % 360;
+      }
+      if (hue >= 15 && hue < 45) pick = 'sticky-orange.png';
+      else if (hue >= 90 && hue < 200) pick = 'sticky-green.png';
+      else if (hue >= 260 || hue < 15) pick = 'sticky-pink.png';
+    }
+  }
+  return pick;
+}
+
+/**
+ * The seeded skin texture for a paper-family piece: colored stickies keep
+ * their hue-matched variant; otherwise the seed picks among the numbered
+ * alternates that actually loaded. Null when no texture applies.
+ */
+function pickSkinTexVar(item, rng) {
+  if (!state.textures) { rng(); return null; }
+  var kind = item.zone;
+  var pick = null;
+  if (kind === 'corkboard' && item.appearance && item.appearance.color) {
+    pick = stickyColorVariant(item.appearance.color);
+    if (!state.textures.has(pick)) pick = null;
+  }
+  if (!pick) {
+    var pool = (TEXTURE_VARIANTS[kind] || []).filter(function (f) { return state.textures.has(f); });
+    if (!pool.length) { rng(); return null; }
+    pick = pool[Math.floor(rng() * pool.length) % pool.length];
+  } else {
+    rng();
+  }
+  return 'var(' + TEXTURE_VARS[pick] + ')';
+}
+
+/* ── Announcer + toast ───────────────────────────────────────────── */
+
+function announce(text) {
+  els.liveRegion.textContent = '';
+  window.requestAnimationFrame(function () { els.liveRegion.textContent = text; });
+}
+
+function toast(text) {
+  clearTimeout(state.toastTimer);
+  els.toast.textContent = text;
+  els.toast.hidden = false;
+  requestAnimationFrame(function () { els.toast.classList.add('show'); });
+  state.toastTimer = setTimeout(function () {
+    els.toast.classList.remove('show');
+    setTimeout(function () { els.toast.hidden = true; }, 260);
+  }, 2200);
+}
+
+/* ── Screen switching ────────────────────────────────────────────── */
+
+function showScreen(name) {
+  ['screenMenu', 'screenPlay', 'screenError', 'screenEditor'].forEach(function (key) {
+    if (els[key]) els[key].hidden = key !== name;
+  });
+}
+
+function showOverlay(el) { el.hidden = false; }
+function hideOverlay(el) { el.hidden = true; }
+
+function showErrorScreen(message) {
+  els.errorMessage.textContent = message;
+  showScreen('screenError');
+}
+
+/* ── Registry + puzzle loading ───────────────────────────────────── */
+
+function fetchJson(url) {
+  return fetch(url, { cache: 'no-store' }).then(function (res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return res.json();
+  });
+}
+
+function loadRegistry() {
+  return fetchJson('puzzles/index.json').catch(function () { return SAMPLE_INDEX; });
+}
+
+function loadPuzzleByEntry(entry) {
+  return fetchJson('puzzles/' + entry.file).catch(function () {
+    if (entry.id === SAMPLE_PUZZLE.id) return SAMPLE_PUZZLE;
+    throw new Error('Could not load puzzle "' + entry.id + '" (fetch failed and no embedded fallback matches).');
+  });
+}
+
+/* ── Menu rendering (archive uses delegation — no per-item binds) ── */
+
+function renderMenu(registry) {
+  els.archiveList.innerHTML = '';
+  var puzzles = (registry.puzzles || []).slice().sort(function (a, b) {
+    return (b.date || '').localeCompare(a.date || '');
+  });
+  if (!puzzles.length) {
+    var empty = document.createElement('p');
+    empty.className = 'archive-empty';
+    empty.textContent = 'No archived puzzles yet.';
+    els.archiveList.appendChild(empty);
+    return;
+  }
+  puzzles.forEach(function (entry) {
+    var li = document.createElement('li');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'archive-item-btn' + (entry.id === registry.current ? ' current' : '');
+    btn.dataset.puzzleId = entry.id;
+    btn.dataset.puzzleFile = entry.file;
+    var titleSpan = document.createElement('span');
+    titleSpan.textContent = entry.title;
+    var dateSpan = document.createElement('span');
+    dateSpan.className = 'archive-date';
+    dateSpan.textContent = entry.date || '';
+    btn.appendChild(titleSpan);
+    btn.appendChild(dateSpan);
+    li.appendChild(btn);
+    els.archiveList.appendChild(li);
+  });
+}
+
+/* ── Geometry ────────────────────────────────────────────────────── */
+
+/** An element's rect in play-area coordinates. */
+function rectRel(el) {
+  var pr = els.playArea.getBoundingClientRect();
+  var r = el.getBoundingClientRect();
+  return {
+    left: r.left - pr.left,
+    top: r.top - pr.top,
+    right: r.right - pr.left,
+    bottom: r.bottom - pr.top,
+    width: r.width,
+    height: r.height,
+    cx: r.left - pr.left + r.width / 2,
+    cy: r.top - pr.top + r.height / 2,
+  };
+}
+
+function pointIn(rect, x, y) {
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+/* ── Opening a puzzle ────────────────────────────────────────────── */
+
+function openPuzzle(puzzleData) {
+  normalizeKinds(puzzleData);
+  try {
+    validateCase(puzzleData);
+  } catch (err) {
+    showErrorScreen(err.message);
+    return;
+  }
+
+  // Old-namespace saves for this puzzle must never linger.
+  if (!state.previewMode) {
+    LEGACY_SAVE_NS.forEach(function (ns) {
+      try { localStorage.removeItem(ns + puzzleData.id); } catch (e) { /* ignore */ }
+    });
+  }
+
+  // Orphan any previous game instance completely — no stale listeners.
+  if (state.game) state.game.events.removeAll();
+  state.drag = null;
+
+  var game = new DeskPuzzleGame(puzzleData, { casual: state.settings.casual });
+  state.game = game;
+
+  var healed = state.previewMode ? null : sanitizeEngineSave(loadSavedGame(puzzleData.id), puzzleData);
+  if (healed) {
+    game.restore(healed);
+    state.desk = restoreDeskState(healed, puzzleData, game);
+  } else {
+    state.desk = freshDeskState(puzzleData);
+  }
+
+  if (game.phase === 'intro') game.setPhase('playing');
+
+  // Anonymous slide letters (A, B, C… in item order — ids, not hints).
+  state.slideLetters = {};
+  (function () {
+    var n = 0;
+    puzzleData.items.forEach(function (i) {
+      if (i.zone === 'rack') state.slideLetters[i.id] = String.fromCharCode(65 + n++);
+    });
+  })();
+
+  // Modular machines: render only what this puzzle declares.
+  state.activeMachines = puzzleMachines(puzzleData);
+  els.machineScope.hidden = !hasMachine('scope');
+  els.scopePanel.hidden = !hasMachine('scope');
+  els.machineLightbox.hidden = !hasMachine('lightbox');
+  els.machinePrinter.hidden = !hasMachine('printer');
+  if (!hasMachine('scope')) state.desk.scope = null;
+  syncZoomControl();
+
+  game.events.on('change', onEngineChange);
+  game.events.on('phase', onPhaseChange);
+
+  state.scopeView = { obj: '4', panX: 0.5, panY: 0.5 };
+  state.scopeSources = {};
+
+  buildPieces();
+  showScreen('screenPlay');
+
+  // First layout pass without transitions so pieces don't fly in from 0,0.
+  els.pieceLayer.classList.add('no-anim');
+  syncAll();
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () { els.pieceLayer.classList.remove('no-anim'); });
+  });
+
+  persistGame();
+  if (game.phase === 'won' || game.phase === 'lost') showResults();
+}
+
+function onEngineChange() {
+  persistGame();
+  syncAll();
+}
+
+function onPhaseChange(p) {
+  if (p === 'won') {
+    playSound('win');
+    announce('You solved the puzzle with ' + state.game.mistakes + ' mistake' + (state.game.mistakes === 1 ? '' : 's') + '.');
+    setTimeout(showResults, 450);
+  } else if (p === 'lost') {
+    playSound('lose');
+    announce('Out of mistakes. Here are the answers.');
+    setTimeout(showResults, 450);
+  }
+}
+
+/* ── Pieces: build once per puzzle, sync forever ─────────────────── */
+
+function buildPieces() {
+  var puzzle = state.game.puzzle;
+  els.pieceLayer.innerHTML = '';
+  state.pieceEls = {};
+
+  puzzle.items.forEach(function (item) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'piece ' + PIECE_CLASS[item.zone];
+    b.dataset.itemId = item.id;
+    b.setAttribute('aria-describedby', 'piece-hint');
+
+    // Deterministic per-piece seed: handwriting jitter + visual variety.
+    var rng = mulberry32(hashString(item.id));
+
+    if (item.zone === 'corkboard') {
+      var color = (item.appearance && item.appearance.color) || fallbackColor(item.id);
+      b.style.setProperty('--pc-color', color);
+    }
+
+    // Paper-family pieces get a seeded "skin": texture variant, flip,
+    // brightness/hue jitter, corner fold, and sometimes a tape strip —
+    // so no two pieces read as clones.
+    if (PAPER_FAMILY[item.zone]) decoratePaperPiece(b, item, rng);
+
+    if (item.zone === 'rack') {
+      // Slide: anonymous letter on the frosted end (A, B, C… — an
+      // identifier, never a hint). The clue itself needs the microscope.
+      var frost = document.createElement('span');
+      frost.className = 'piece-frost';
+      var letter = document.createElement('span');
+      letter.className = 'slide-letter';
+      letter.setAttribute('aria-hidden', 'true');
+      letter.textContent = state.slideLetters[item.id] || '';
+      frost.appendChild(letter);
+      b.appendChild(frost);
+    } else if (item.zone === 'tubes') {
+      // X-ray film: lit layer only shows inside the light-box overlap.
+      var lit = document.createElement('span');
+      lit.className = 'film-lit';
+      lit.setAttribute('aria-hidden', 'true');
+      if (item.info && item.info.image) {
+        lit.classList.add('has-image');
+        lit.style.backgroundImage = 'url("' + item.info.image + '")';
+      } else {
+        var litLabel = document.createElement('span');
+        litLabel.className = 'film-lit-label';
+        litLabel.textContent = item.label;
+        lit.appendChild(litLabel);
+      }
+      b.appendChild(lit);
+      var filmEtch = document.createElement('span');
+      filmEtch.className = 'piece-etch';
+      filmEtch.setAttribute('aria-hidden', 'true');
+      filmEtch.textContent = item.label;
+      b.appendChild(filmEtch);
+    } else if (item.zone === 'photo') {
+      // Photograph: the image IS the clue; without one, a gray "no photo"
+      // window with the label written on the bottom border strip.
+      var win = document.createElement('span');
+      win.className = 'photo-window';
+      win.setAttribute('aria-hidden', 'true');
+      if (item.info && item.info.image) {
+        win.style.backgroundImage = 'url("' + item.info.image + '")';
+        win.classList.add('has-image');
+      }
+      b.appendChild(win);
+      if (!(item.info && item.info.image)) {
+        var cap = document.createElement('span');
+        cap.className = 'piece-label photo-caption';
+        cap.textContent = item.label;
+        cap.style.setProperty('--ink-rot', (-1.5 + 3 * rng()).toFixed(2) + 'deg');
+        cap.style.setProperty('--ink-size', (0.92 + 0.16 * rng()).toFixed(3));
+        b.appendChild(cap);
+      }
+    } else if (item.zone === 'rx') {
+      // Prescription: printed ℞ glyph, medication line in handwriting.
+      var glyph = document.createElement('span');
+      glyph.className = 'rx-glyph';
+      glyph.setAttribute('aria-hidden', 'true');
+      glyph.textContent = '℞';
+      b.appendChild(glyph);
+      var med = document.createElement('span');
+      med.className = 'piece-label rx-line';
+      med.textContent = item.label;
+      med.style.setProperty('--ink-rot', (-2 + 4 * rng()).toFixed(2) + 'deg');
+      med.style.setProperty('--ink-size', (0.92 + 0.16 * rng()).toFixed(3));
+      b.appendChild(med);
+    } else {
+      var label = document.createElement('span');
+      label.className = 'piece-label';
+      label.textContent = item.label;
+      label.style.setProperty('--ink-rot', (-2 + 4 * rng()).toFixed(2) + 'deg');
+      label.style.setProperty('--ink-size', (0.92 + 0.16 * rng()).toFixed(3));
+      b.appendChild(label);
+    }
+
+    state.pieceEls[item.id] = b;
+    els.pieceLayer.appendChild(b);
+  });
+}
+
+/** Seeded variety for paper-family pieces (stickies/papers/photos/scripts). */
+function decoratePaperPiece(b, item, rng) {
+  var skin = document.createElement('span');
+  skin.className = 'piece-skin';
+  skin.setAttribute('aria-hidden', 'true');
+  skin.style.setProperty('--skin-flip', rng() < 0.5 ? '1' : '-1');
+  var bright = (0.965 + rng() * 0.07).toFixed(3);
+  var hue = (-4 + rng() * 8).toFixed(1);
+  skin.style.setProperty('--skin-filter', 'brightness(' + bright + ') hue-rotate(' + hue + 'deg)');
+  var tex = pickSkinTexVar(item, rng);
+  if (tex) skin.style.setProperty('--skin-tex', tex);
+  if (item.zone === 'rx') skin.style.setProperty('--skin-skew', (-1.5 + rng() * 3).toFixed(2) + 'deg');
+  b.appendChild(skin);
+
+  var fold = document.createElement('span');
+  fold.className = 'piece-fold fold-' + ['tl', 'tr', 'bl', 'br'][Math.floor(rng() * 4)];
+  fold.setAttribute('aria-hidden', 'true');
+  if (state.textures && state.textures.has('overlays/fold-1.png')) fold.classList.add('fold-tex');
+  b.appendChild(fold);
+
+  if (rng() < 0.55) {
+    var tape = document.createElement('span');
+    tape.className = 'piece-tape';
+    tape.setAttribute('aria-hidden', 'true');
+    tape.style.setProperty('--tape-rot', (-20 + rng() * 40).toFixed(1) + 'deg');
+    tape.style.setProperty('--tape-x', (22 + rng() * 56).toFixed(0) + '%');
+    if (state.textures) {
+      var tapes = ['overlays/tape-1.png', 'overlays/tape-2.png'].filter(function (f) { return state.textures.has(f); });
+      if (tapes.length) tape.style.setProperty('--tape-tex', 'var(' + TEXTURE_VARS[tapes[Math.floor(rng() * tapes.length) % tapes.length]] + ')');
+    }
+    b.appendChild(tape);
+  }
+}
+
+/* Where does this piece currently live? */
+function pieceLocation(id) {
+  var game = state.game;
+  var cell = game.cellOfItem(id);
+  if (cell) return { kind: 'tray', box: cell.box, slot: cell.slot, locked: game.isBoxLocked(cell.box) };
+  if (state.desk.scope === id) return { kind: 'scope' };
+  return { kind: 'desk' };
+}
+
+/**
+ * The viewer is a SQUARE sized from the height left between the header
+ * and the tray HUD; the desk gets the remaining width at the same
+ * height. Below 900px the CSS stacking layout takes over instead.
+ */
+function sizeViewer() {
+  if (!els.screenPlay || els.screenPlay.hidden) return;
+  if (window.innerWidth < 900) {
+    els.scopePanel.style.width = '';
+    els.scopeDisplayWrap.style.width = '';
+    els.scopeDisplayWrap.style.height = '';
+    return;
+  }
+  var headerEl = els.screenPlay.querySelector('.play-header');
+  var controlsH = 46; // zoom/pan row inside the panel
+  var chromeH = headerEl.getBoundingClientRect().height
+    + els.trayHud.getBoundingClientRect().height
+    + 46; // screen paddings + gaps
+  var avail = window.innerHeight - chromeH - controlsH;
+  var side = clamp(avail, 220, Math.min(680, window.innerWidth * 0.42));
+  els.scopeDisplayWrap.style.width = side + 'px';
+  els.scopeDisplayWrap.style.height = side + 'px';
+  els.scopePanel.style.width = (side + 22) + 'px';
+  renderScopeView();
+}
+
+function syncAll() {
+  if (!state.game) return;
+  sizeViewer();
+  syncHeader();
+  syncTrays();
+  syncMachines();
+  syncPieces();
+}
+
+function syncHeader() {
+  var game = state.game;
+  var puzzle = game.puzzle;
+  els.puzzleTitle.textContent = puzzle.title;
+  els.puzzleDate.textContent = puzzle.date || '';
+  document.title = puzzle.title + ' : Desk Puzzle';
+
+  els.mistakeTracker.innerHTML = '';
+  var box = document.createElement('div');
+  box.className = 'guesses';
+  box.id = 'guesses-box';
+  var lab = document.createElement('span');
+  lab.className = 'guesses-label';
+  lab.textContent = state.settings.casual ? 'Mistakes' : 'Guesses left';
+  box.appendChild(lab);
+  if (state.settings.casual) {
+    var count = document.createElement('span');
+    count.className = 'guesses-count';
+    count.textContent = String(game.mistakes);
+    box.appendChild(count);
+  } else {
+    var wrap = document.createElement('div');
+    wrap.className = 'pips';
+    for (var i = 0; i < MAX_MISTAKES; i++) {
+      var pip = document.createElement('span');
+      pip.className = 'pip' + (i < game.mistakes ? ' used' : '');
+      wrap.appendChild(pip);
+    }
+    box.appendChild(wrap);
+    var count2 = document.createElement('span');
+    count2.className = 'guesses-count';
+    count2.textContent = String(Math.max(0, MAX_MISTAKES - game.mistakes));
+    box.appendChild(count2);
+  }
+  els.mistakeTracker.appendChild(box);
+  els.mistakeTracker.setAttribute('aria-label',
+    state.settings.casual ? game.mistakes + ' mistakes so far' : Math.max(0, MAX_MISTAKES - game.mistakes) + ' guesses left');
+}
+
+function syncTrays() {
+  var game = state.game;
+  for (var b = 0; b < BOX_COUNT; b++) {
+    var locked = game.isBoxLocked(b);
+    var solvedEntry = null;
+    for (var i = 0; i < game.solved.length; i++) {
+      if (game.solved[i].boxIndex === b) solvedEntry = game.solved[i];
+    }
+    var group = solvedEntry
+      ? game.puzzle.groups.find(function (g) { return g.id === solvedEntry.groupId; })
+      : null;
+
+    trayEls[b].classList.toggle('is-locked', locked);
+    if (group) {
+      trayEls[b].style.setProperty('--group-color', 'var(--tier-' + group.tier + ')');
+      trayEls[b].style.setProperty('--group-ink', 'var(--tier-' + group.tier + '-ink)');
+      trayHeaderEls[b].textContent = group.name;
+    } else {
+      trayEls[b].style.removeProperty('--group-color');
+      trayEls[b].style.removeProperty('--group-ink');
+      trayHeaderEls[b].textContent = 'Tray ' + String.fromCharCode(65 + b);
+    }
+
+    var count = game.staging[b].filter(function (c) { return c !== null; }).length;
+    lockBtnEls[b].disabled = locked || count !== GROUP_SIZE;
+    lockBtnEls[b].hidden = locked;
+  }
+}
+
+/* ── Machines sync: scope display + printer counter ──────────────── */
+
+function hintsLeft() {
+  if (!hasMachine('printer')) return 0;
+  return state.settings.casual ? Infinity : Math.max(0, HINTS_MAX - state.desk.hintsUsed);
+}
+
+function syncMachines() {
+  if (hasMachine('scope')) renderScopeView();
+  if (!hasMachine('printer')) { els.printerCount.innerHTML = ''; return; }
+  // Printer counter: three blank chips that deplete (∞ in casual mode).
+  els.printerCount.innerHTML = '';
+  if (state.settings.casual) {
+    els.printerCount.textContent = '∞';
+  } else {
+    var left = hintsLeft();
+    for (var i = 0; i < HINTS_MAX; i++) {
+      var chip = document.createElement('span');
+      chip.className = 'label-chip' + (i < HINTS_MAX - left ? ' spent' : '');
+      els.printerCount.appendChild(chip);
+    }
+  }
+  els.printerCount.setAttribute('aria-label',
+    state.settings.casual ? 'Unlimited blank labels' : hintsLeft() + ' blank labels left');
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * SCOPE DISPLAY — canvas viewport with objectives, pan, and resize.
+ * NO text is drawn for slides with a real image; slides WITHOUT one get
+ * their label rendered as the etched-glass specimen itself (otherwise a
+ * text-only puzzle would be unsolvable).
+ * ════════════════════════════════════════════════════════════════════ */
+
+/** Procedural specimen for slides without a scope image: the word IS the
+    tissue — etched into pink glass, readable at any magnification. */
+function makeLabelSpecimen(item) {
+  var w = 900, h = 560;
+  var c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  var ctx = c.getContext('2d');
+  if (!ctx) return c;
+  var rng = mulberry32(hashString(item.id));
+
+  var grad = ctx.createLinearGradient(0, 0, w, h);
+  grad.addColorStop(0, '#f6ebf0');
+  grad.addColorStop(1, '#eddbe5');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+
+  // faint smear field
+  for (var i = 0; i < 26; i++) {
+    ctx.beginPath();
+    ctx.ellipse(rng() * w, rng() * h, 30 + rng() * 110, 18 + rng() * 60, rng() * Math.PI, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(214,120,150,' + (0.04 + rng() * 0.07).toFixed(3) + ')';
+    ctx.fill();
+  }
+  // speckles
+  for (var j = 0; j < 140; j++) {
+    ctx.beginPath();
+    ctx.arc(rng() * w, rng() * h, 0.6 + rng() * 2.2, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(96,44,96,' + (0.08 + rng() * 0.16).toFixed(3) + ')';
+    ctx.fill();
+  }
+
+  // the etched word
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  var size = 170;
+  ctx.font = '700 ' + size + 'px Georgia, serif';
+  while (ctx.measureText(item.label).width > w * 0.86 && size > 40) {
+    size -= 10;
+    ctx.font = '700 ' + size + 'px Georgia, serif';
+  }
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate((-3 + rng() * 6) * Math.PI / 180);
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillText(item.label, 2, 3);
+  ctx.fillStyle = 'rgba(93,58,102,0.6)';
+  ctx.fillText(item.label, 0, 0);
+  ctx.strokeStyle = 'rgba(93,58,102,0.35)';
+  ctx.lineWidth = 2;
+  ctx.strokeText(item.label, 0, 0);
+  ctx.restore();
+  return c;
+}
+
+/** Resolve the docked slide's view source (cached; images load async). */
+function scopeSource(item) {
+  var cached = state.scopeSources[item.id];
+  if (cached) return cached.ready ? cached.el : null;
+  if (item.scope && item.scope.image) {
+    var img = new Image();
+    var entry = { el: img, ready: false };
+    state.scopeSources[item.id] = entry;
+    img.onload = function () { entry.ready = true; renderScopeView(); };
+    img.onerror = function () {
+      // fall back to the etched-label specimen
+      state.scopeSources[item.id] = { el: makeLabelSpecimen(item), ready: true };
+      renderScopeView();
+    };
+    img.src = item.scope.image;
+    return null;
+  }
+  var spec = { el: makeLabelSpecimen(item), ready: true };
+  state.scopeSources[item.id] = spec;
+  return spec.el;
+}
+
+function renderScopeView() {
+  var canvas = els.scopeCanvas;
+  if (!canvas) return;
+  var cw = els.scopeDisplayWrap.clientWidth;
+  var ch = els.scopeDisplayWrap.clientHeight;
+  if (cw < 10 || ch < 10) return;
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  var ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // idle bed
+  var bed = ctx.createRadialGradient(cw / 2, ch / 2, 10, cw / 2, ch / 2, Math.max(cw, ch) * 0.7);
+  bed.addColorStop(0, '#f4ecdc');
+  bed.addColorStop(1, '#d9cdb4');
+  ctx.fillStyle = bed;
+  ctx.fillRect(0, 0, cw, ch);
+
+  var slideId = state.desk && state.desk.scope;
+  var titleEl = document.getElementById('scope-slide-title');
+  if (titleEl) titleEl.textContent = slideId ? 'Slide ' + (state.slideLetters[slideId] || '') : '';
+  if (!slideId) {
+    // empty stage: a faint objective circle, no text
+    ctx.beginPath();
+    ctx.arc(cw / 2, ch / 2, Math.min(cw, ch) * 0.3, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(77, 68, 55, 0.25)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    return;
+  }
+
+  var item = itemById(slideId);
+  var src = scopeSource(item);
+  if (!src) {
+    // image still loading: soft shimmer ring
+    ctx.beginPath();
+    ctx.arc(cw / 2, ch / 2, Math.min(cw, ch) * 0.3, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(122, 79, 192, 0.35)';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    return;
+  }
+
+  var sw = src.width, sh = src.height;
+  var cover = Math.max(cw / sw, ch / sh);
+  var scale = cover * OBJECTIVES[state.scopeView.obj];
+  var vw = cw / scale, vh = ch / scale;
+
+  // clamp pan so the view window stays inside the specimen
+  var minX = vw / 2 / sw, maxX = 1 - minX;
+  var minY = vh / 2 / sh, maxY = 1 - minY;
+  state.scopeView.panX = vw >= sw ? 0.5 : clamp(state.scopeView.panX, minX, maxX);
+  state.scopeView.panY = vh >= sh ? 0.5 : clamp(state.scopeView.panY, minY, maxY);
+
+  var sx = state.scopeView.panX * sw - vw / 2;
+  var sy = state.scopeView.panY * sh - vh / 2;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(src, sx, sy, vw, vh, 0, 0, cw, ch);
+
+  // soft vignette so it reads as an eyepiece feed
+  var vg = ctx.createRadialGradient(cw / 2, ch / 2, Math.min(cw, ch) * 0.42, cw / 2, ch / 2, Math.max(cw, ch) * 0.72);
+  vg.addColorStop(0, 'rgba(40, 30, 16, 0)');
+  vg.addColorStop(1, 'rgba(40, 30, 16, 0.35)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, cw, ch);
+}
+
+var OBJ_STOPS = ['4', '10', '40'];
+var ZOOM_KNOB_POS = [12, 50, 88]; // % along the track, matching the detents
+
+function objStopIndex() {
+  var i = OBJ_STOPS.indexOf(state.scopeView.obj);
+  return i < 0 ? 0 : i;
+}
+
+function syncZoomControl() {
+  var i = objStopIndex();
+  els.zoomKnob.style.left = ZOOM_KNOB_POS[i] + '%';
+  els.zoomLabel.textContent = OBJ_STOPS[i] + '×';
+  els.zoomTrack.setAttribute('aria-valuenow', String(i));
+  els.zoomTrack.setAttribute('aria-valuetext', OBJ_STOPS[i] + ' times');
+}
+
+function setObjective(obj) {
+  if (!OBJECTIVES[obj] || state.scopeView.obj === obj) return;
+  state.scopeView.obj = obj;
+  syncZoomControl();
+  playSound('dial-tick');
+  renderScopeView();
+  announce('Objective ' + obj + ' times.');
+}
+
+function panScope(dir) {
+  var v = state.scopeView;
+  var step = 0.12 / OBJECTIVES[v.obj]; // finer steps when zoomed in
+  if (dir === 'up') v.panY -= step;
+  if (dir === 'down') v.panY += step;
+  if (dir === 'left') v.panX -= step;
+  if (dir === 'right') v.panX += step;
+  playSound('pan-tick');
+  renderScopeView();
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * FILM LIGHTING — the light box shines THROUGH films. Each film's lit
+ * layer is clipped to the geometric intersection of the film rect with
+ * the light box rect, so half-on means half-lit. Films never rotate.
+ * ════════════════════════════════════════════════════════════════════ */
+
+function updateFilmLighting() {
+  if (!state.game || !state.desk) return;
+  if (!hasMachine('lightbox')) return; // no box, nothing lights
+  var boxR = els.lightboxScreen.getBoundingClientRect();
+  var filmAspect = state.textureAspect && state.textureAspect['film.png'];
+  state.game.puzzle.items.forEach(function (item) {
+    if (item.zone !== 'tubes') return;
+    var el = state.pieceEls[item.id];
+    if (!el) return;
+    var lit = el.firstChild && el.querySelector('.film-lit');
+    if (!lit) return;
+    var r = el.getBoundingClientRect();
+
+    // `background-size: contain` (and the matching mask-size on .film-lit)
+    // fits the alpha-trimmed film texture inside the piece's CSS box —
+    // whenever the texture's aspect ratio doesn't match the box exactly,
+    // that leaves a letterboxed margin where nothing is actually drawn.
+    // Light must track the texture's real visible edges, not the box's,
+    // or the lit window reads as offset from the film ("refraction").
+    var visLeft = r.left, visRight = r.right, visTop = r.top, visBottom = r.bottom;
+    if (filmAspect && el.classList.contains('textured')) {
+      var boxAspect = r.width / r.height;
+      if (filmAspect < boxAspect) { // texture relatively taller — letterboxed left/right
+        var visW = r.height * filmAspect;
+        var padX = (r.width - visW) / 2;
+        visLeft = r.left + padX;
+        visRight = r.right - padX;
+      } else if (filmAspect > boxAspect) { // texture relatively wider — letterboxed top/bottom
+        var visH = r.width / filmAspect;
+        var padY = (r.height - visH) / 2;
+        visTop = r.top + padY;
+        visBottom = r.bottom - padY;
+      }
+    }
+
+    if (boxR.left >= visRight || boxR.right <= visLeft || boxR.top >= visBottom || boxR.bottom <= visTop) {
+      lit.style.clipPath = 'inset(100%)';
+      return;
+    }
+    var top = Math.max(0, boxR.top - r.top, visTop - r.top);
+    var left = Math.max(0, boxR.left - r.left, visLeft - r.left);
+    var right = Math.max(0, r.right - boxR.right, r.right - visRight);
+    var bottom = Math.max(0, r.bottom - boxR.bottom, r.bottom - visBottom);
+    lit.style.clipPath = 'inset(' + top.toFixed(1) + 'px ' + right.toFixed(1) + 'px ' + bottom.toFixed(1) + 'px ' + left.toFixed(1) + 'px)';
+  });
+}
+
+/** Films animate into place over ~0.22s — recompute after they settle. */
+function scheduleFilmLighting() {
+  updateFilmLighting();
+  clearTimeout(state.filmLightTimer);
+  state.filmLightTimer = setTimeout(updateFilmLighting, 280);
+}
+
+/* ── Piece sync: position, classes, aria, labels ─────────────────── */
+
+function syncPieces() {
+  var game = state.game;
+  var deskRect = rectRel(els.deskSurface);
+  var stageRect = rectRel(els.scopeStage);
+
+  game.puzzle.items.forEach(function (item) {
+    var id = item.id;
+    var el = state.pieceEls[id];
+    if (!el) return;
+
+    // Textures may arrive after buildPieces — update skin + class then.
+    if (state.textures) {
+      var skinEl = el.querySelector('.piece-skin');
+      if (skinEl && !skinEl.style.getPropertyValue('--skin-tex')) {
+        var tex = pickSkinTexVar(item, mulberry32(hashString(item.id)));
+        if (tex) skinEl.style.setProperty('--skin-tex', tex);
+      }
+      var hasType = PAPER_FAMILY[item.zone]
+        ? !!(skinEl && skinEl.style.getPropertyValue('--skin-tex'))
+        : state.textures.has({ rack: 'slide.png', tubes: 'film.png' }[item.zone]);
+      el.classList.toggle('textured', !!hasType);
+    }
+
+    // Printed hint label (idempotent).
+    if (state.desk.labels[id] && !el.querySelector('.hint-label')) {
+      var tag = document.createElement('span');
+      tag.className = 'hint-label';
+      tag.setAttribute('aria-hidden', 'true');
+      tag.textContent = item.label;
+      el.appendChild(tag);
+    }
+
+    if (state.drag && state.drag.id === id) return; // never fight an active drag
+
+    var loc = pieceLocation(id);
+    var frozen = loc.kind === 'tray' && loc.locked;
+    var x, y, rot;
+
+    if (loc.kind === 'tray') {
+      var slotRect = rectRel(slotEls[loc.box][loc.slot]);
+      x = slotRect.cx;
+      y = slotRect.cy;
+      rot = 0;
+    } else if (loc.kind === 'scope') {
+      x = stageRect.cx;
+      y = stageRect.cy - 4;
+      rot = 0;
+    } else {
+      var p = state.desk.pos[id];
+      x = deskRect.left + p.fx * deskRect.width;
+      y = deskRect.top + p.fy * deskRect.height;
+      rot = state.desk.rot[id];
+    }
+
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+    el.style.setProperty('--rot', rot + 'deg');
+    el.style.zIndex = String(10 + (state.desk.z[id] || 1));
+
+    el.classList.toggle('in-tray', loc.kind === 'tray');
+    el.classList.toggle('on-machine', loc.kind === 'scope');
+    el.classList.toggle('is-locked', frozen);
+    el.tabIndex = frozen ? -1 : 0;
+
+    var noun = PIECE_NOUN[item.zone];
+    var where;
+    if (loc.kind === 'tray') {
+      if (frozen) {
+        var g = groupOfItem(game.puzzle, id);
+        where = 'locked in ' + g.name;
+      } else {
+        where = 'in ' + TRAY_NAMES[loc.box] + ', slot ' + (loc.slot + 1);
+      }
+    } else if (loc.kind === 'scope') {
+      where = 'on the microscope stage';
+    } else {
+      where = 'on the desk';
+    }
+    var labeled = state.desk.labels[id] ? ', labeled' : '';
+    var spoken = item.zone === 'rack' ? 'Slide ' + (state.slideLetters[id] || '?') : item.label;
+    el.setAttribute('aria-label', spoken + ', ' + noun + labeled + ', ' + where);
+  });
+
+  scheduleFilmLighting();
+}
+
+/* ── The label printer ───────────────────────────────────────────── */
+
+function printLabel(id) {
+  var item = itemById(id);
+  if (state.desk.labels[id]) {
+    toast('That piece already has a label.');
+    announce(item.label + ' already has a label.');
+    return false;
+  }
+  if (!hasMachine('printer')) {
+    toast('This puzzle has no label printer.');
+    announce('This puzzle has no label printer.');
+    return false;
+  }
+  if (hintsLeft() <= 0) {
+    toast('Out of blank labels.');
+    announce('No blank labels left.');
+    return false;
+  }
+  state.desk.labels[id] = true;
+  state.desk.hintsUsed += 1;
+  playSound('print');
+  announce('Label printed: ' + item.label + '.');
+  syncAll();
+  persistGame();
+  return true;
+}
+
+/* ── Dragging (Pointer Events, handlers bound ONCE in init) ─────── */
+
+function forceEndStaleDrag() {
+  var d = state.drag;
+  if (!d) return;
+  if (d.hotEl) d.hotEl.classList.remove('drop-hot');
+  d.el.classList.remove('is-dragging');
+  state.drag = null;
+  stopPieceDrag();
+  settleOnDesk(d.id, null, null, null);
+  syncAll();
+  persistGame();
+}
+
+function onPointerDown(ev) {
+  // Dev layout mode: machines are draggable instead of pieces.
+  if (state.layoutMode && layoutPointerDown(ev)) return;
+
+  if (!state.game || state.game.phase !== 'playing') return;
+  var pieceEl = ev.target.closest ? ev.target.closest('.piece') : null;
+  if (!pieceEl) return;
+
+  // A stale drag session (missed pointerup) must never wedge the game.
+  if (state.drag) forceEndStaleDrag();
+
+  var id = pieceEl.dataset.itemId;
+  var loc = pieceLocation(id);
+  if (loc.kind === 'tray' && loc.locked) return;
+
+  ev.preventDefault();
+  pieceEl.focus({ preventScroll: true });
+  try { pieceEl.setPointerCapture(ev.pointerId); } catch (e) { /* stale pointer id — document handlers still track */ }
+
+  var playRect = els.playArea.getBoundingClientRect();
+  var r = pieceEl.getBoundingClientRect();
+  var cx = r.left - playRect.left + r.width / 2;
+  var cy = r.top - playRect.top + r.height / 2;
+  var px = ev.clientX - playRect.left;
+  var py = ev.clientY - playRect.top;
+
+  var item = itemById(id);
+  var wasStaged = loc.kind === 'tray';
+  var wasDocked = loc.kind === 'scope';
+  state.desk.z[id] = ++state.desk.zTop;
+
+  state.drag = {
+    id: id,
+    el: pieceEl,
+    pointerId: ev.pointerId,
+    offX: px - cx,
+    offY: py - cy,
+    playRect: playRect,
+    wasStaged: wasStaged,
+    wasDocked: wasDocked,
+    isFilm: item.zone === 'tubes',
+    rects: {
+      desk: rectRel(els.deskSurface),
+      stage: hasMachine('scope') ? rectRel(els.scopeStage) : NEVER_RECT,
+      printer: hasMachine('printer') ? rectRel(els.printerBody) : NEVER_RECT,
+      trays: trayEls.map(function (t) { return rectRel(t); }),
+      slots: slotEls.map(function (row) { return row.map(function (s) { return rectRel(s); }); }),
+    },
+    hotEl: null,
+  };
+
+  pieceEl.classList.add('is-dragging');
+  pieceEl.style.setProperty('--rot', '0deg');
+  pieceEl.style.zIndex = String(10 + state.desk.z[id]);
+  pieceEl.style.left = cx + 'px';
+  pieceEl.style.top = cy + 'px';
+
+  // Pickup side effects AFTER the drag session exists, so the engine's
+  // change → syncAll pass skips this piece instead of repositioning it.
+  if (wasStaged) state.game.unstage(id);
+  if (wasDocked) { state.desk.scope = null; renderScopeView(); }
+
+  pieceSound(item.zone, 'pickup');
+  startPieceDrag(item.zone, ev.clientX, ev.clientY);
+}
+
+function dragPoint(ev) {
+  var d = state.drag;
+  return {
+    x: ev.clientX - d.playRect.left - d.offX,
+    y: ev.clientY - d.playRect.top - d.offY,
+  };
+}
+
+function onPointerMove(ev) {
+  if (state.layoutDrag) { layoutPointerMove(ev); return; }
+  if (state.zoomDrag) { zoomDragMove(ev); return; }
+  if (state.scopePanning) { scopePanMove(ev); return; }
+  var d = state.drag;
+  if (!d || ev.pointerId !== d.pointerId) return;
+  ev.preventDefault();
+  var p = dragPoint(ev);
+  d.el.style.left = p.x + 'px';
+  d.el.style.top = p.y + 'px';
+  updateDropHot(p.x, p.y);
+  movePieceDrag(ev.clientX, ev.clientY);
+  if (d.isFilm) updateFilmLighting(); // light-through follows the drag live
+}
+
+function updateDropHot(x, y) {
+  var d = state.drag;
+  var c = classifyDrop(classifyInput(d, x, y));
+  var hot = null;
+  if (c.kind === 'slot' || c.kind === 'tray-full') hot = trayEls[c.box];
+  else if (c.kind === 'scope') hot = els.scopeStage;
+  else if (c.kind === 'printer') hot = els.machinePrinter;
+  if (d.hotEl && d.hotEl !== hot) d.hotEl.classList.remove('drop-hot');
+  if (hot && d.hotEl !== hot) hot.classList.add('drop-hot');
+  d.hotEl = hot;
+}
+
+function onPointerUp(ev) {
+  if (state.layoutDrag) { state.layoutDrag = null; return; }
+  if (state.zoomDrag) { zoomDragEnd(); return; }
+  if (state.scopePanning) { scopePanEnd(); return; }
+  var d = state.drag;
+  if (!d || ev.pointerId !== d.pointerId) return;
+  var p = dragPoint(ev);
+  if (d.hotEl) d.hotEl.classList.remove('drop-hot');
+  d.el.classList.remove('is-dragging');
+  state.drag = null;
+  stopPieceDrag();
+  applyDrop(d, p.x, p.y);
+  syncAll();
+  persistGame();
+}
+
+function onPointerCancel(ev) {
+  if (state.layoutDrag) { state.layoutDrag = null; return; }
+  if (state.zoomDrag) { zoomDragEnd(); return; }
+  if (state.scopePanning) { scopePanEnd(); return; }
+  var d = state.drag;
+  if (!d || ev.pointerId !== d.pointerId) return;
+  if (d.hotEl) d.hotEl.classList.remove('drop-hot');
+  d.el.classList.remove('is-dragging');
+  state.drag = null;
+  stopPieceDrag();
+  settleOnDesk(d.id, null, null, d.rects.desk);
+  syncAll();
+  persistGame();
+}
+
+/**
+ * PURE drop classifier — no DOM, no globals. Given the drop point, the
+ * cached target rects, and current occupancy, decide what a drop means.
+ * returns: {kind:'slot',box,slot} | {kind:'tray-locked'|'tray-full',box}
+ *   | {kind:'scope'|'scope-wrong'|'scope-occupied'}
+ *   | {kind:'printer'|'printer-labeled'|'printer-empty'} | {kind:'desk'}
+ */
+function classifyDrop(input) {
+  for (var b = 0; b < input.rects.trays.length; b++) {
+    if (!pointIn(input.rects.trays[b], input.x, input.y)) continue;
+    if (input.lockedBoxes[b]) return { kind: 'tray-locked', box: b };
+    var slot = -1;
+    for (var s = 0; s < input.rects.slots[b].length; s++) {
+      if (pointIn(input.rects.slots[b][s], input.x, input.y) && input.staging[b][s] === null) {
+        slot = s;
+        break;
+      }
+    }
+    if (slot < 0) slot = input.staging[b].indexOf(null);
+    if (slot < 0) return { kind: 'tray-full', box: b };
+    return { kind: 'slot', box: b, slot: slot };
+  }
+  if (pointIn(input.rects.stage, input.x, input.y)) {
+    if (input.zone !== 'rack') return { kind: 'scope-wrong' };
+    if (input.scope && input.scope !== input.itemId) return { kind: 'scope-occupied' };
+    return { kind: 'scope' };
+  }
+  if (pointIn(input.rects.printer, input.x, input.y)) {
+    if (input.labeled) return { kind: 'printer-labeled' };
+    if (input.hintsLeft <= 0) return { kind: 'printer-empty' };
+    return { kind: 'printer' };
+  }
+  return { kind: 'desk' };
+}
+
+/** Assemble classifyDrop's input from the live drag session + game state. */
+function classifyInput(d, x, y) {
+  var game = state.game;
+  return {
+    x: x,
+    y: y,
+    rects: d.rects,
+    zone: itemById(d.id).zone,
+    itemId: d.id,
+    lockedBoxes: [0, 1, 2, 3].map(function (b) { return game.isBoxLocked(b); }),
+    staging: game.staging,
+    scope: state.desk.scope,
+    labeled: !!state.desk.labels[d.id],
+    hintsLeft: hintsLeft(),
+  };
+}
+
+/** Apply a classified drop's side effects (engine, machines, sounds, aria). */
+function applyDrop(d, x, y) {
+  var game = state.game;
+  var id = d.id;
+  var item = itemById(id);
+  var c = classifyDrop(classifyInput(d, x, y));
+
+  switch (c.kind) {
+    case 'slot': {
+      var result = game.stageToSlot(id, c.box, c.slot);
+      if (result === 'staged' || result === 'moved') {
+        pieceSound(item.zone, 'drop');
+        announce(item.label + ' placed in ' + TRAY_NAMES[c.box] + ', slot ' + (c.slot + 1) + '.');
+      } else {
+        settleOnDesk(id, x, y, d.rects.desk);
+      }
+      return;
+    }
+    case 'tray-locked':
+      toast('That tray is locked.');
+      break;
+    case 'tray-full':
+      toast('Tray ' + String.fromCharCode(65 + c.box) + ' is full.');
+      break;
+    case 'scope':
+      state.desk.scope = id;
+      state.scopeView = { obj: '4', panX: 0.5, panY: 0.5 }; // fresh slide, fresh view
+      syncZoomControl();
+      playSound('dock-glass');
+      announce('On the microscope: ' + revealText(item));
+      return;
+    case 'scope-wrong':
+      toast('Only slides go on the microscope stage.');
+      break;
+    case 'scope-occupied':
+      toast('The stage already holds a slide.');
+      break;
+    case 'printer':
+      printLabel(id);
+      settleOnDesk(id, x, y, d.rects.desk);
+      return;
+    case 'printer-labeled':
+      toast('That piece already has a label.');
+      break;
+    case 'printer-empty':
+      toast('Out of blank labels.');
+      break;
+    case 'desk':
+      settleOnDesk(id, x, y, d.rects.desk);
+      pieceSound(item.zone, 'drop');
+      if (d.wasStaged || d.wasDocked) {
+        announce(item.label + ' returned to the desk.');
+      }
+      return;
+  }
+
+  // Rejected drops (locked/full/wrong/occupied) settle back onto the desk.
+  settleOnDesk(id, x, y, d.rects.desk);
+}
+
+/** Park a piece on the desk. Pass x/y = null to keep its stored spot. */
+function settleOnDesk(id, x, y, deskRect) {
+  if (x !== null && y !== null && deskRect) {
+    var fx = clamp((x - deskRect.left) / deskRect.width, 0.04, 0.96);
+    var fy = clamp((y - deskRect.top) / deskRect.height, 0.06, 0.94);
+    state.desk.pos[id] = { fx: fx, fy: fy };
+  }
+  var item = itemById(id);
+  state.desk.rot[id] = item.zone === 'tubes' ? 0 : -7 + Math.random() * 14;
+}
+
+/* ── Viewer input: zoom drag + pan (bound once). The viewer is permanent
+   — no dock, no collapse. ── */
+
+/* Zoom drag: the knob follows the pointer; the objective switches (with a
+   dial tick) whenever the nearest detent changes; release snaps the knob. */
+function zoomTrackDown(ev) {
+  ev.preventDefault();
+  try { els.zoomTrack.setPointerCapture(ev.pointerId); } catch (e) { /* ok */ }
+  els.zoomTrack.classList.add('is-dragging');
+  state.zoomDrag = { pointerId: ev.pointerId };
+  els.zoomTrack.focus({ preventScroll: true });
+  zoomDragMove(ev);
+}
+
+function zoomDragMove(ev) {
+  var zd = state.zoomDrag;
+  if (!zd || ev.pointerId !== zd.pointerId) return;
+  ev.preventDefault();
+  var r = els.zoomTrack.getBoundingClientRect();
+  var f = clamp((ev.clientX - r.left) / r.width, 0, 1) * 100;
+  els.zoomKnob.style.left = f + '%';
+  var best = 0;
+  for (var i = 1; i < ZOOM_KNOB_POS.length; i++) {
+    if (Math.abs(f - ZOOM_KNOB_POS[i]) < Math.abs(f - ZOOM_KNOB_POS[best])) best = i;
+  }
+  setObjective(OBJ_STOPS[best]); // no-op (no tick) while the detent is unchanged
+  els.zoomKnob.style.left = f + '%'; // keep following the finger — snap happens on release
+}
+
+function zoomDragEnd() {
+  if (!state.zoomDrag) return;
+  state.zoomDrag = null;
+  els.zoomTrack.classList.remove('is-dragging');
+  syncZoomControl(); // snap to the detent
+}
+
+function onZoomTrackKey(ev) {
+  var i = objStopIndex();
+  if (ev.key === 'ArrowRight' || ev.key === 'ArrowUp') { ev.preventDefault(); setObjective(OBJ_STOPS[Math.min(OBJ_STOPS.length - 1, i + 1)]); }
+  else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowDown') { ev.preventDefault(); setObjective(OBJ_STOPS[Math.max(0, i - 1)]); }
+  else if (ev.key === 'Home') { ev.preventDefault(); setObjective(OBJ_STOPS[0]); }
+  else if (ev.key === 'End') { ev.preventDefault(); setObjective(OBJ_STOPS[OBJ_STOPS.length - 1]); }
+}
+
+
+function scopeCanvasDown(ev) {
+  if (!state.desk || !state.desk.scope) return;
+  ev.preventDefault();
+  try { els.scopeCanvas.setPointerCapture(ev.pointerId); } catch (e) { /* ok */ }
+  state.scopePanning = { pointerId: ev.pointerId, lastX: ev.clientX, lastY: ev.clientY };
+  els.scopeCanvas.classList.add('is-panning');
+}
+
+function scopePanMove(ev) {
+  var p = state.scopePanning;
+  if (!p || ev.pointerId !== p.pointerId) return;
+  ev.preventDefault();
+  var item = itemById(state.desk.scope);
+  var src = item && scopeSource(item);
+  if (!src) return;
+  var cw = els.scopeDisplayWrap.clientWidth;
+  var cover = Math.max(cw / src.width, els.scopeDisplayWrap.clientHeight / src.height);
+  var scale = cover * OBJECTIVES[state.scopeView.obj];
+  state.scopeView.panX -= (ev.clientX - p.lastX) / (scale * src.width);
+  state.scopeView.panY -= (ev.clientY - p.lastY) / (scale * src.height);
+  p.lastX = ev.clientX;
+  p.lastY = ev.clientY;
+  renderScopeView();
+}
+
+function scopePanEnd() {
+  state.scopePanning = null;
+  els.scopeCanvas.classList.remove('is-panning');
+}
+
+/* ── Keyboard controls (bound ONCE on document) ─────────────────── */
+
+function onKeyDown(ev) {
+  if (ev.key === 'Escape' && !els.overlayHelp.hidden) {
+    hideOverlay(els.overlayHelp);
+    return;
+  }
+  if (ev.key === 'Escape' && !els.overlaySettings.hidden) {
+    hideOverlay(els.overlaySettings);
+    return;
+  }
+  if (!state.game || state.game.phase !== 'playing') return;
+  if (!els.overlayHelp.hidden || !els.overlayResults.hidden || !els.overlaySettings.hidden) return;
+
+  var active = document.activeElement;
+  if (!active || !active.classList || !active.classList.contains('piece')) return;
+  var id = active.dataset.itemId;
+  var item = itemById(id);
+  var loc = pieceLocation(id);
+  if (loc.kind === 'tray' && loc.locked) return;
+
+  if (ev.key.length === 1 && ev.key >= '1' && ev.key <= '4') {
+    ev.preventDefault();
+    sendToTray(id, Number(ev.key) - 1);
+  } else if (ev.key === '0' || ev.key === 'Backspace') {
+    ev.preventDefault();
+    returnToDesk(id);
+  } else if (ev.key === 'v' || ev.key === 'V') {
+    ev.preventDefault();
+    viewOnMachine(id, item);
+  } else if (ev.key === 'l' || ev.key === 'L') {
+    ev.preventDefault();
+    printLabel(id);
+    state.pieceEls[id].focus({ preventScroll: true });
+  } else if (ev.key.indexOf('Arrow') === 0) {
+    if (loc.kind !== 'desk') return;
+    ev.preventDefault();
+    var p = state.desk.pos[id];
+    if (ev.key === 'ArrowLeft') p.fx = clamp(p.fx - 0.025, 0.04, 0.96);
+    if (ev.key === 'ArrowRight') p.fx = clamp(p.fx + 0.025, 0.04, 0.96);
+    if (ev.key === 'ArrowUp') p.fy = clamp(p.fy - 0.035, 0.06, 0.94);
+    if (ev.key === 'ArrowDown') p.fy = clamp(p.fy + 0.035, 0.06, 0.94);
+    syncPieces();
+    persistGame();
+  }
+}
+
+function sendToTray(id, b) {
+  var game = state.game;
+  var item = itemById(id);
+  if (game.isBoxLocked(b)) {
+    announce(TRAY_NAMES[b] + ' is locked.');
+    toast('That tray is locked.');
+    return;
+  }
+  var slot = game.firstEmptySlot(b);
+  if (slot < 0) {
+    announce(TRAY_NAMES[b] + ' is full.');
+    toast('Tray ' + String.fromCharCode(65 + b) + ' is full.');
+    return;
+  }
+  if (state.desk.scope === id) { state.desk.scope = null; renderScopeView(); }
+  var result = game.stageToSlot(id, b, slot);
+  if (result === 'staged' || result === 'moved') {
+    pieceSound(item.zone, 'drop');
+    announce(item.label + ' placed in ' + TRAY_NAMES[b] + ', slot ' + (slot + 1) + '.');
+    state.pieceEls[id].focus({ preventScroll: true });
+  }
+  syncAll();
+  persistGame();
+}
+
+function returnToDesk(id) {
+  var game = state.game;
+  var item = itemById(id);
+  var loc = pieceLocation(id);
+  if (loc.kind === 'tray') {
+    game.unstage(id); // change event syncs + persists
+  } else if (loc.kind === 'scope') {
+    state.desk.scope = null;
+    renderScopeView();
+  } else {
+    return;
+  }
+  pieceSound(item.zone, 'drop');
+  announce(item.label + ' returned to the desk.');
+  state.pieceEls[id].focus({ preventScroll: true });
+  syncAll();
+  persistGame();
+}
+
+function viewOnMachine(id, item) {
+  if (item.zone === 'rack' && !hasMachine('scope')) { announce('This puzzle has no microscope.'); return; }
+  if (item.zone === 'tubes' && !hasMachine('lightbox')) { announce('This puzzle has no light box.'); return; }
+  if (item.zone === 'rack') {
+    if (state.game.isStaged(id)) state.game.unstage(id);
+    state.desk.scope = id; // replaces any current slide (it returns to its desk spot)
+    state.scopeView = { obj: '4', panX: 0.5, panY: 0.5 };
+    syncZoomControl();
+    playSound('dock-glass');
+    announce('On the microscope: ' + revealText(item));
+  } else if (item.zone === 'tubes') {
+    // Films don't dock — V slides the film onto the light box glass.
+    if (state.game.isStaged(id)) state.game.unstage(id);
+    var lr = rectRel(els.lightboxScreen);
+    var dr = rectRel(els.deskSurface);
+    state.desk.pos[id] = {
+      fx: clamp((lr.cx - dr.left) / dr.width, 0.04, 0.96),
+      fy: clamp((lr.cy - dr.top) / dr.height, 0.06, 0.94),
+    };
+    state.desk.rot[id] = 0;
+    state.desk.z[id] = ++state.desk.zTop;
+    playSound('film-rustle');
+    announce('On the light box: ' + revealText(item));
+  } else {
+    announce(item.label + ' reads directly — no machine needed.');
+    return;
+  }
+  state.pieceEls[id].focus({ preventScroll: true });
+  syncAll();
+  persistGame();
+}
+
+/** Spoken description of what a machine reveals for an item (aria only —
+    the displays themselves stay text-free). */
+function revealText(item) {
+  var parts = [item.label];
+  var info = item.info || {};
+  if (info.title && info.title !== item.label) parts.push(info.title);
+  if (info.text) parts.push(info.text);
+  if (item.analyzer && item.analyzer.lines && item.analyzer.lines.length) {
+    parts.push(item.analyzer.lines.join(', '));
+  }
+  return parts.join('. ');
+}
+
+/* ── Lock In (delegated click on #trays, bound ONCE) ────────────── */
+
+function onTraysClick(ev) {
+  var lockBtn = ev.target.closest ? ev.target.closest('[data-lock]') : null;
+  if (!lockBtn || !state.game) return;
+  var b = Number(lockBtn.dataset.lock);
+  var game = state.game;
+  var result = game.submitBox(b);
+  if (result.kind === 'incomplete') return;
+
+  if (result.kind === 'correct') {
+    playSound('correct');
+    announce('Correct! "' + result.group.name + '" locked in.');
+  } else {
+    playSound('wrong');
+    playSound('wrong-crack');
+    var gbox = document.getElementById('guesses-box');
+    if (gbox) {
+      gbox.classList.remove('wrong-feedback');
+      void gbox.offsetWidth;
+      gbox.classList.add('wrong-feedback');
+      var lastPip = gbox.querySelectorAll('.pip.used');
+      lastPip = lastPip[lastPip.length - 1];
+      if (lastPip) lastPip.classList.add('just-broke');
+      setTimeout(function () {
+        gbox.classList.remove('wrong-feedback');
+        if (lastPip) lastPip.classList.remove('just-broke');
+      }, 700);
+    }
+    slotEls[b].forEach(function (slotEl) {
+      slotEl.classList.remove('wrong-shake');
+      void slotEl.offsetWidth;
+      slotEl.classList.add('wrong-shake');
+    });
+    var msg = state.settings.casual
+      ? 'Not quite. Mistake ' + game.mistakes + '.'
+      : 'Not quite. ' + Math.max(game.mistakesLeft, 0) + ' mistake' + (game.mistakesLeft === 1 ? '' : 's') + ' left.';
+    if (result.oneAway) {
+      msg += ' One away!';
+      playSound('one-away');
+      toast('One away!');
+    }
+    announce(msg);
+  }
+}
+
+/* ── Scatter (re-spread the desk pieces; internal name stays "shuffle") ── */
+
+function onShuffle() {
+  var game = state.game;
+  if (!game || game.phase !== 'playing') return;
+  game.puzzle.items.forEach(function (item) {
+    var loc = pieceLocation(item.id);
+    if (loc.kind !== 'desk') return;
+    state.desk.pos[item.id] = scatterSpot(Math.random);
+    state.desk.rot[item.id] = item.zone === 'tubes' ? 0 : -15 + 30 * Math.random();
+  });
+  playSound('shuffle');
+  syncPieces();
+  persistGame();
+  announce('Desk pieces scattered.');
+}
+
+/* ── Results overlay + share ─────────────────────────────────────── */
+
+function showResults() {
+  var game = state.game;
+  var won = game.phase === 'won';
+  els.resultsTitle.textContent = won ? 'Solved!' : 'Out of mistakes';
+  els.resultsSub.textContent = won
+    ? 'Solved with ' + game.mistakes + ' mistake' + (game.mistakes === 1 ? '' : 's') + '.'
+    : 'Here is how the groups fit together.';
+  els.resultsHints.textContent = 'Hints used: ' + state.desk.hintsUsed;
+
+  els.resultsGroups.innerHTML = '';
+  var solvedGroupIds = new Set(game.solved.map(function (s) { return s.groupId; }));
+  var ordered = game.puzzle.groups.slice().sort(function (a, b) { return a.tier - b.tier; });
+  ordered.forEach(function (g) {
+    var card = document.createElement('div');
+    card.className = 'result-placard' + (solvedGroupIds.has(g.id) ? ' solved-by-player' : '');
+    card.style.setProperty('--group-color', 'var(--tier-' + g.tier + ')');
+    var nameEl = document.createElement('p');
+    nameEl.className = 'result-placard-name';
+    nameEl.textContent = 'Tier ' + g.tier;
+    var h3 = document.createElement('h3');
+    h3.textContent = g.name;
+    var itemsEl = document.createElement('p');
+    itemsEl.className = 'result-placard-items';
+    itemsEl.textContent = g.itemIds.map(function (id) { return itemById(id).label; }).join(' · ');
+    var explEl = document.createElement('p');
+    explEl.className = 'result-placard-explanation';
+    explEl.textContent = g.explanation;
+    card.appendChild(nameEl);
+    card.appendChild(h3);
+    card.appendChild(itemsEl);
+    card.appendChild(explEl);
+    els.resultsGroups.appendChild(card);
+  });
+
+  els.shareFallback.hidden = true;
+  showOverlay(els.overlayResults);
+}
+
+function buildShareText() {
+  var game = state.game;
+  var puzzle = game.puzzle;
+  var lines = [];
+  lines.push('Desk Puzzle: Paper Edition');
+  lines.push(puzzle.title + (puzzle.date ? ', ' + puzzle.date : ''));
+  lines.push('Mistakes: ' + game.mistakes + (state.settings.casual ? ' (casual)' : '/' + MAX_MISTAKES));
+  if (state.desk.hintsUsed > 0) lines.push('Hints: ' + state.desk.hintsUsed);
+  lines.push('');
+  game.attempts.forEach(function (attempt) {
+    var row = attempt.itemIds.map(function (id) {
+      var group = groupOfItem(puzzle, id);
+      return TIER_EMOJI[group.tier] || '⬜';
+    }).join('');
+    lines.push(row);
+  });
+  return lines.join('\n');
+}
+
+function onShare() {
+  var text = buildShareText();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () {
+      toast('Copied to clipboard!');
+    }, function () { showShareFallback(text); });
+  } else {
+    showShareFallback(text);
+  }
+}
+
+function showShareFallback(text) {
+  els.shareFallback.value = text;
+  els.shareFallback.hidden = false;
+  els.shareFallback.focus();
+  els.shareFallback.select();
+  toast('Select the text below to copy.');
+}
+
+/* ── Menu / navigation actions ───────────────────────────────────── */
+
+function playToday() {
+  els.btnPlayToday.disabled = true; // double-clicks must not double-open
+  loadRegistry().then(function (registry) {
+    var entry = (registry.puzzles || []).find(function (p) { return p.id === registry.current; })
+      || { id: registry.current, file: registry.current + '.json' };
+    return loadPuzzleByEntry(entry);
+  }).then(openPuzzle).catch(function (err) {
+    showErrorScreen(err.message);
+  }).finally(function () {
+    els.btnPlayToday.disabled = false;
+  });
+}
+
+function onArchiveClick(ev) {
+  var btn = ev.target.closest ? ev.target.closest('.archive-item-btn') : null;
+  if (!btn) return;
+  var entry = { id: btn.dataset.puzzleId, file: btn.dataset.puzzleFile };
+  loadPuzzleByEntry(entry).then(openPuzzle).catch(function (err) {
+    showErrorScreen(err.message);
+  });
+}
+
+function backToMenu() {
+  showScreen('screenMenu');
+  refreshMenu();
+}
+
+function refreshMenu() {
+  loadRegistry().then(renderMenu);
+}
+
+function onPlayAgain() {
+  hideOverlay(els.overlayResults);
+  var puzzle = state.game.puzzle;
+  try { localStorage.removeItem(saveKey(puzzle.id)); } catch (e) { /* ignore */ }
+  openPuzzle(JSON.parse(JSON.stringify(puzzle)));
+}
+
+/* ── Deep link (?puzzle=<id>) ────────────────────────────────────── */
+
+function tryDeepLink() {
+  var params = new URLSearchParams(window.location.search);
+  var puzzleId = params.get('puzzle');
+  if (!puzzleId) return false;
+
+  loadRegistry().then(function (registry) {
+    var entry = (registry.puzzles || []).find(function (p) { return p.id === puzzleId; });
+    if (!entry) {
+      if (puzzleId === SAMPLE_PUZZLE.id) {
+        openPuzzle(SAMPLE_PUZZLE);
+        return;
+      }
+      showErrorScreen('No puzzle found for id "' + puzzleId + '".');
+      return;
+    }
+    return loadPuzzleByEntry(entry).then(openPuzzle);
+  }).catch(function (err) { showErrorScreen(err.message); });
+  return true;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * DEV — LAYOUT MODE (?layout). Drag machines on the desk; sliders for
+ * everything else; persists to localStorage; exports layout JSON.
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* Live sound overrides: a `sound` block persisted with the layout. */
+var EDITABLE_CUES = ['pickup-paper', 'drop-paper', 'pickup-glass', 'drop-glass', 'dock-glass',
+  'film-rustle', 'dial-tick', 'pan-tick', 'print', 'shuffle', 'correct', 'wrong', 'wrong-crack',
+  'one-away', 'win', 'lose'];
+
+/* Cue keys stay internal ids (also the manifest.json override names) —
+   this only relabels the sound-editor row for the ones with a different
+   user-facing name in the UI. */
+var CUE_DISPLAY_NAMES = { shuffle: 'scatter' };
+
+function applySoundLayer(sound) {
+  if (!sound || typeof sound !== 'object') return;
+  if (isFinite(sound.master)) {
+    SOUND_TUNING.master = sound.master;
+    if (audio.master) audio.master.gain.value = sound.master;
+  }
+  if (sound.cues) {
+    EDITABLE_CUES.forEach(function (c) {
+      if (isFinite(sound.cues[c]) && SOUND_TUNING[c]) SOUND_TUNING[c].gain = sound.cues[c];
+    });
+  }
+  if (sound.scrape) {
+    Object.keys(sound.scrape).forEach(function (k) {
+      if (isFinite(sound.scrape[k]) && k in SOUND_TUNING.scrape) SOUND_TUNING.scrape[k] = sound.scrape[k];
+    });
+  }
+  if (sound.matGains) {
+    Object.keys(SOUND_TUNING.scrape.materials).forEach(function (m) {
+      if (isFinite(sound.matGains[m])) SOUND_TUNING.scrape.materials[m].gain = sound.matGains[m];
+    });
+  }
+}
+
+function collectSoundLayer() {
+  var cues = {};
+  EDITABLE_CUES.forEach(function (c) { cues[c] = SOUND_TUNING[c].gain; });
+  var sc = SOUND_TUNING.scrape;
+  return {
+    master: SOUND_TUNING.master,
+    cues: cues,
+    scrape: {
+      vOn: sc.vOn, vOff: sc.vOff, grainPx: sc.grainPx, cooldownMs: sc.cooldownMs,
+      gainLo: sc.gainLo, gainHi: sc.gainHi, vRef: sc.vRef,
+      pitchLo: sc.pitchLo, pitchHi: sc.pitchHi, volJitterDb: sc.volJitterDb,
+    },
+    matGains: {
+      paper: sc.materials.paper.gain,
+      slide: sc.materials.slide.gain,
+      film: sc.materials.film.gain,
+    },
+  };
+}
+
+function resetSoundLayer() {
+  var d = JSON.parse(JSON.stringify(SOUND_DEFAULTS));
+  SOUND_TUNING.master = d.master;
+  EDITABLE_CUES.forEach(function (c) { SOUND_TUNING[c] = d[c]; });
+  SOUND_TUNING.scrape = d.scrape;
+  SOUND_TUNING.dragBed = d.dragBed;
+  SOUND_TUNING.dragGrain = d.dragGrain;
+  if (audio.master) audio.master.gain.value = d.master;
+}
+
+function layoutPointerDown(ev) {
+  var machine = ev.target.closest ? ev.target.closest('.machine') : null;
+  if (!machine) return false;
+  ev.preventDefault();
+  var deskRect = els.deskSurface.getBoundingClientRect();
+  state.layoutDrag = { el: machine, deskRect: deskRect };
+  return true;
+}
+
+function layoutPointerMove(ev) {
+  var ld = state.layoutDrag;
+  if (!ld) return;
+  ev.preventDefault();
+  var fx = clamp((ev.clientX - ld.deskRect.left) / ld.deskRect.width, 0, 0.97);
+  var fy = clamp((ev.clientY - ld.deskRect.top) / ld.deskRect.height, 0, 0.95);
+  var key = ld.el === els.machineScope ? 'scope' : ld.el === els.machineLightbox ? 'lightbox' : 'printer';
+  state.layout[key].fx = fx;
+  state.layout[key].fy = fy;
+  applyLayout();
+  persistLayout();
+  if (state.game) { syncPieces(); }
+}
+
+var LAYOUT_UI_KEY = SAVE_PREFIX + 'layout-ui';
+
+function devSectionState() {
+  try { return JSON.parse(localStorage.getItem(LAYOUT_UI_KEY) || '{}'); } catch (e) { return {}; }
+}
+function saveDevSectionState(title, open) {
+  var m = devSectionState();
+  m[title] = open;
+  try { localStorage.setItem(LAYOUT_UI_KEY, JSON.stringify(m)); } catch (e) { /* ignore */ }
+}
+
+/** A collapsible dev-panel section (chevron summary, persisted state). */
+function devSection(parent, title, defaultOpen) {
+  var d = document.createElement('details');
+  d.className = 'dev-section';
+  var saved = devSectionState()[title];
+  d.open = saved === undefined ? !!defaultOpen : !!saved;
+  var s = document.createElement('summary');
+  s.textContent = title;
+  d.appendChild(s);
+  d.addEventListener('toggle', function () { saveDevSectionState(title, d.open); });
+  parent.appendChild(d);
+  return d;
+}
+
+function devSlider(parent, labelText, min, max, step, get, set) {
+  var label = document.createElement('label');
+  label.textContent = labelText;
+  var input = document.createElement('input');
+  input.type = 'range';
+  input.min = String(min);
+  input.max = String(max);
+  input.step = String(step);
+  input.value = String(get());
+  input.addEventListener('input', function () {
+    set(parseFloat(input.value));
+    applyLayout();
+    persistLayout();
+    if (state.game) syncAll();
+    renderScopeView();
+  });
+  parent.appendChild(label);
+  parent.appendChild(input);
+  return input;
+}
+
+function buildLayoutPanel() {
+  var L = state.layout;
+  var panel = els.layoutPanel;
+  panel.innerHTML = '';
+  panel.hidden = false;
+  document.body.classList.add('layout-mode');
+  state.layoutMode = true;
+
+  // slide-away tab (the whole panel gets out of the way, like the 3D editor)
+  var oldTab = document.querySelector('.panel-tab');
+  if (oldTab) oldTab.remove();
+  var tab = document.createElement('button');
+  tab.type = 'button';
+  tab.className = 'panel-tab';
+  tab.textContent = 'Layout';
+  tab.title = 'Show/hide the layout panel';
+  tab.addEventListener('click', function () {
+    panel.classList.toggle('panel-hidden');
+  });
+  document.body.appendChild(tab);
+
+  var h = document.createElement('h2');
+  h.textContent = 'Layout mode';
+  var note = document.createElement('p');
+  note.className = 'lp-note';
+  note.textContent = 'Drag the machines on the desk directly. Everything saves as you go; use the side tab to get the panel out of the way.';
+  panel.appendChild(h);
+  panel.appendChild(note);
+
+  // ── Desk & machines ──
+  var secDesk = devSection(panel, 'Light box & scatter', true);
+  devSlider(secDesk, 'Light box width (px)', 160, 380, 2, function () { return L.lightbox.w; }, function (v) { L.lightbox.w = v; });
+  devSlider(secDesk, 'Light box height (px)', 90, 240, 2, function () { return L.lightbox.h; }, function (v) { L.lightbox.h = v; });
+  devSlider(secDesk, 'Scatter band top', 0.15, 0.6, 0.01, function () { return L.scatter.lo; }, function (v) { L.scatter.lo = Math.min(v, L.scatter.hi - 0.05); });
+  devSlider(secDesk, 'Scatter band bottom', 0.5, 0.98, 0.01, function () { return L.scatter.hi; }, function (v) { L.scatter.hi = Math.max(v, L.scatter.lo + 0.05); });
+
+  // ── Piece sizes ──
+  var secSizes = devSection(panel, 'Piece sizes', false);
+  ['sticky', 'paper', 'slide', 'film', 'photo', 'rx'].forEach(function (t) {
+    devSlider(secSizes, t, 0.6, 1.6, 0.02, function () { return L.pieceScale[t]; }, function (v) { L.pieceScale[t] = v; });
+  });
+
+  // ── Sound editor ──
+  var secSound = devSection(panel, 'Sound', false);
+  function soundSlider(parent, labelText, min, max, step, get, set) {
+    var label = document.createElement('label');
+    label.textContent = labelText;
+    var input = document.createElement('input');
+    input.type = 'range';
+    input.min = String(min); input.max = String(max); input.step = String(step);
+    input.value = String(get());
+    input.addEventListener('input', function () {
+      set(parseFloat(input.value));
+      persistLayout();
+    });
+    parent.appendChild(label);
+    parent.appendChild(input);
+  }
+  soundSlider(secSound, 'Master volume', 0, 1, 0.02,
+    function () { return SOUND_TUNING.master; },
+    function (v) { SOUND_TUNING.master = v; if (audio.master) audio.master.gain.value = v; });
+
+  var cueHead = document.createElement('label');
+  cueHead.textContent = 'Cue gains (▶ to audition)';
+  secSound.appendChild(cueHead);
+  EDITABLE_CUES.forEach(function (cue) {
+    var row = document.createElement('div');
+    row.className = 'cue-row';
+    var name = document.createElement('span');
+    name.className = 'cue-name';
+    name.textContent = CUE_DISPLAY_NAMES[cue] || cue;
+    var input = document.createElement('input');
+    input.type = 'range';
+    input.min = '0'; input.max = '0.6'; input.step = '0.01';
+    input.value = String(SOUND_TUNING[cue].gain);
+    input.addEventListener('input', function () {
+      SOUND_TUNING[cue].gain = parseFloat(input.value);
+      persistLayout();
+    });
+    var play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'btn';
+    play.textContent = '▶';
+    play.setAttribute('aria-label', 'Play ' + cue);
+    play.addEventListener('click', function () { playSound(cue); });
+    row.appendChild(name); row.appendChild(input); row.appendChild(play);
+    secSound.appendChild(row);
+  });
+
+  var dragHead = document.createElement('label');
+  dragHead.textContent = 'Drag scrape (default path)';
+  secSound.appendChild(dragHead);
+  var sc = SOUND_TUNING.scrape;
+  soundSlider(secSound, 'Gate on (px/s)', 80, 600, 5, function () { return sc.vOn; }, function (v) { sc.vOn = v; });
+  soundSlider(secSound, 'Gate off (px/s)', 30, 400, 5, function () { return sc.vOff; }, function (v) { sc.vOff = Math.min(v, sc.vOn - 10); });
+  soundSlider(secSound, 'Grain spacing (px)', 40, 220, 2, function () { return sc.grainPx; }, function (v) { sc.grainPx = v; });
+  soundSlider(secSound, 'Grain cooldown (ms)', 30, 140, 1, function () { return sc.cooldownMs; }, function (v) { sc.cooldownMs = v; });
+  soundSlider(secSound, 'Gain at gate', 0.05, 1, 0.01, function () { return sc.gainLo; }, function (v) { sc.gainLo = v; });
+  soundSlider(secSound, 'Gain at speed ref', 0.2, 1.4, 0.01, function () { return sc.gainHi; }, function (v) { sc.gainHi = v; });
+  soundSlider(secSound, 'Speed ref (px/s)', 600, 2400, 20, function () { return sc.vRef; }, function (v) { sc.vRef = v; });
+  soundSlider(secSound, 'Pitch low', 0.8, 1, 0.005, function () { return sc.pitchLo; }, function (v) { sc.pitchLo = v; });
+  soundSlider(secSound, 'Pitch high', 1, 1.25, 0.005, function () { return sc.pitchHi; }, function (v) { sc.pitchHi = v; });
+  soundSlider(secSound, 'Volume jitter (dB)', 0, 5, 0.1, function () { return sc.volJitterDb; }, function (v) { sc.volJitterDb = v; });
+  soundSlider(secSound, 'Paper grain gain', 0, 0.3, 0.005, function () { return sc.materials.paper.gain; }, function (v) { sc.materials.paper.gain = v; });
+  soundSlider(secSound, 'Glass grain gain', 0, 0.3, 0.005, function () { return sc.materials.slide.gain; }, function (v) { sc.materials.slide.gain = v; });
+  soundSlider(secSound, 'Film grain gain', 0, 0.3, 0.005, function () { return sc.materials.film.gain; }, function (v) { sc.materials.film.gain = v; });
+
+  var soundReset = document.createElement('button');
+  soundReset.type = 'button';
+  soundReset.className = 'btn btn-ghost';
+  soundReset.textContent = 'Reset sound to defaults';
+  soundReset.addEventListener('click', function () {
+    resetSoundLayer();
+    persistLayout();
+    buildLayoutPanel();
+  });
+  secSound.appendChild(soundReset);
+
+  // ── actions ──
+  var actions = document.createElement('div');
+  actions.className = 'lp-actions';
+  var exportBtn = document.createElement('button');
+  exportBtn.type = 'button';
+  exportBtn.className = 'btn btn-primary';
+  exportBtn.textContent = 'Export layout JSON';
+  exportBtn.addEventListener('click', function () {
+    state.layout.sound = collectSoundLayer();
+    downloadJson('layout.json', state.layout);
+    toast('Downloaded layout.json — drop it next to index.html to publish this layout.');
+  });
+  var resetBtn = document.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.className = 'btn btn-ghost';
+  resetBtn.textContent = 'Reset to defaults';
+  resetBtn.addEventListener('click', function () {
+    try { localStorage.removeItem(LAYOUT_KEY); } catch (e) { /* ignore */ }
+    resetSoundLayer();
+    loadLayout().then(function () {
+      applyLayout();
+      if (state.game) syncAll();
+      buildLayoutPanel();
+    });
+  });
+  actions.appendChild(exportBtn);
+  actions.appendChild(resetBtn);
+  var publishNote = document.createElement('p');
+  publishNote.className = 'lp-note';
+  publishNote.textContent = 'Save the exported file as "layout.json" in the project root, right next to index.html. The game loads it automatically for everyone on next reload (your own browser’s live edits here still win over it until you clear them).';
+  panel.appendChild(actions);
+  panel.appendChild(publishNote);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * DEV — PUZZLE CREATOR (?editor), v2.
+ * Group-centric authoring: four group cards, each holding its 4 items;
+ * piece types picked by friendly names; machine toggles with inline
+ * cross-check warnings; field-level validation as you type; a single
+ * "ready to export" chip; and a live preview iframe (?preview) that
+ * re-renders the real game ~300ms after each edit.
+ * ════════════════════════════════════════════════════════════════════ */
+
+var KIND_ORDER = ['corkboard', 'folder', 'rack', 'tubes', 'photo', 'rx'];
+
+function loadEditorDraft() {
+  try {
+    var raw = localStorage.getItem(EDITOR_DRAFT_KEY);
+    if (raw) return normalizeDraft(JSON.parse(raw));
+  } catch (e) { /* fall through */ }
+  return normalizeDraft(JSON.parse(JSON.stringify(SAMPLE_PUZZLE)));
+}
+
+function saveEditorDraft() {
+  try { localStorage.setItem(EDITOR_DRAFT_KEY, JSON.stringify(state.editorDraft)); } catch (e) { /* ignore */ }
+}
+
+/** Coerce any draft into the editor's shape: 4 groups × exactly 4 item
+    ids, 16 items, machines list explicit. Old files load unchanged. */
+function normalizeDraft(d) {
+  d = (d && typeof d === 'object') ? d : {};
+  normalizeKinds(d);
+  d.id = d.id || 'my-puzzle';
+  d.title = d.title || 'My Puzzle';
+  d.date = d.date || new Date().toISOString().slice(0, 10);
+  if (!Array.isArray(d.groups)) d.groups = [];
+  if (!Array.isArray(d.items)) d.items = [];
+  d.machines = puzzleMachines(d);
+
+  var itemsById = {};
+  d.items.forEach(function (i) { if (i && i.id) itemsById[i.id] = i; });
+
+  var usedIds = new Set();
+  var groups = [];
+  var items = [];
+  for (var g = 0; g < 4; g++) {
+    var src = d.groups[g] || {};
+    var grp = {
+      id: src.id || 'group-' + (g + 1),
+      name: src.name || '',
+      tier: [1, 2, 3, 4].indexOf(src.tier) !== -1 ? src.tier : (g + 1),
+      explanation: src.explanation || '',
+      itemIds: [],
+    };
+    for (var m = 0; m < 4; m++) {
+      var iid = Array.isArray(src.itemIds) ? src.itemIds[m] : null;
+      var item = (iid && itemsById[iid] && !usedIds.has(iid)) ? itemsById[iid] : null;
+      if (!item) {
+        item = { id: 'g' + (g + 1) + '-item' + (m + 1), label: '', zone: 'corkboard' };
+      }
+      if (!PIECE_KIND_NAMES[item.zone]) item.zone = 'corkboard';
+      while (usedIds.has(item.id)) item.id += 'x';
+      usedIds.add(item.id);
+      grp.itemIds.push(item.id);
+      items.push(item);
+    }
+    groups.push(grp);
+  }
+  d.groups = groups;
+  d.items = items;
+  return d;
+}
+
+/** Slug for auto ids: "Right lung" -> "right-lung". */
+function slugify(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'item';
+}
+
+/** Item at group g, slot m of the draft (always exists after normalize). */
+function draftItem(g, m) {
+  var id = state.editorDraft.groups[g].itemIds[m];
+  return state.editorDraft.items.find(function (i) { return i.id === id; });
+}
+
+/** Re-id an item from its label, keeping ids unique + groups in sync. */
+function autoId(g, m) {
+  var d = state.editorDraft;
+  var item = draftItem(g, m);
+  var base = slugify(item.label || 'g' + (g + 1) + '-item' + (m + 1));
+  var id = base, n = 2;
+  while (d.items.some(function (i) { return i !== item && i.id === id; })) id = base + '-' + n++;
+  item.id = id;
+  d.groups[g].itemIds[m] = id;
+}
+
+/* ── Rendering ───────────────────────────────────────────────────── */
+
+function buildEditor() {
+  state.editorDraft = loadEditorDraft();
+  renderEditor();
+}
+
+function renderEditor() {
+  var d = state.editorDraft;
+  var root = els.screenEditor;
+  root.innerHTML = '';
+
+  // ── The live preview fills the whole screen, at true game size ──
+  var stage = document.createElement('div');
+  stage.className = 'editor-preview-stage';
+  var iframe = document.createElement('iframe');
+  iframe.id = 'preview-frame';
+  iframe.title = 'Live puzzle preview';
+  iframe.src = '?preview&v=7';
+  stage.appendChild(iframe);
+  root.appendChild(stage);
+
+  // ── The authoring form is a collapsible slide-away drawer over it,
+  // same pattern as the ?layout panel: an edge tab toggles it. ──
+  var oldTab = document.querySelector('.panel-tab');
+  if (oldTab) oldTab.remove();
+  var tab = document.createElement('button');
+  tab.type = 'button';
+  tab.className = 'panel-tab';
+  tab.textContent = 'Editor';
+  tab.title = 'Show/hide the puzzle editor';
+  tab.addEventListener('click', function () {
+    drawer.classList.toggle('panel-hidden');
+  });
+  root.appendChild(tab);
+
+  var drawer = document.createElement('div');
+  drawer.className = 'editor-drawer';
+
+  var h1 = document.createElement('h1');
+  h1.textContent = 'Puzzle Creator';
+  var sub = document.createElement('p');
+  sub.className = 'editor-sub';
+  sub.textContent = 'Build a puzzle group by group. Everything saves as you type, and the preview behind this panel plays it live.';
+  drawer.appendChild(h1);
+  drawer.appendChild(sub);
+
+  // ── Top bar: status chip, meta, machine toggles, actions ──
+  var bar = document.createElement('div');
+  bar.className = 'editor-topbar';
+
+  var chip = document.createElement('span');
+  chip.className = 'status-chip';
+  chip.id = 'editor-status-chip';
+  bar.appendChild(chip);
+
+  var meta = document.createElement('div');
+  meta.className = 'editor-meta';
+  [['id', 'text'], ['title', 'text'], ['date', 'date']].forEach(function (pair) {
+    var label = document.createElement('label');
+    label.textContent = pair[0] + ' ';
+    var input = document.createElement('input');
+    input.type = pair[1];
+    input.dataset.meta = pair[0];
+    input.value = d[pair[0]] || '';
+    label.appendChild(input);
+    meta.appendChild(label);
+  });
+  bar.appendChild(meta);
+
+  var toggles = document.createElement('div');
+  toggles.className = 'machine-toggles';
+  toggles.id = 'machine-toggles';
+  bar.appendChild(toggles);
+
+  var actions = document.createElement('div');
+  actions.className = 'editor-actions';
+  actions.appendChild(editorActionBtn('Test Play', 'btn btn-primary', function () {
+    var problems = caseProblems(state.editorDraft);
+    if (problems.length) { toast('Fix the flagged problems first.'); return; }
+    openPuzzle(JSON.parse(JSON.stringify(state.editorDraft)));
+  }));
+  actions.appendChild(editorActionBtn('Export puzzle JSON', 'btn', function () {
+    downloadJson((state.editorDraft.id || 'puzzle') + '.json', state.editorDraft);
+  }));
+  actions.appendChild(editorActionBtn('Export index.json', 'btn', function () {
+    loadRegistry().then(function (registry) {
+      var d2 = state.editorDraft;
+      var entry = { id: d2.id, title: d2.title, date: d2.date, file: d2.id + '.json' };
+      var list = (registry.puzzles || []).filter(function (p) { return p.id !== d2.id; });
+      list.push(entry);
+      downloadJson('index.json', { current: d2.id, puzzles: list });
+    });
+  }));
+  actions.appendChild(editorActionBtn('Start over', 'btn btn-ghost', function () {
+    try { localStorage.removeItem(EDITOR_DRAFT_KEY); } catch (e) { /* ignore */ }
+    buildEditor();
+    pushPreview();
+  }));
+  actions.appendChild(editorActionBtn('Back to menu', 'btn btn-ghost', backToMenu));
+  bar.appendChild(actions);
+  drawer.appendChild(bar);
+
+  // ── Group cards (each already a collapsible <details>) ──
+  var groupsWrap = document.createElement('div');
+  groupsWrap.className = 'editor-groups';
+  for (var g = 0; g < 4; g++) groupsWrap.appendChild(renderGroupCard(g));
+  drawer.appendChild(groupsWrap);
+
+  var note = document.createElement('p');
+  note.className = 'preview-note';
+  note.textContent = 'The real game, replayed on every edit, fills the screen behind this panel. Use Test Play for a standalone full-size run, or the tab to tuck this panel away.';
+  drawer.appendChild(note);
+
+  root.appendChild(drawer);
+
+  renderMachineToggles();
+  refreshEditorStatus();
+  pushPreview();
+}
+
+function renderGroupCard(g) {
+  var d = state.editorDraft;
+  var grp = d.groups[g];
+  var card = document.createElement('details');
+  card.open = true;
+  card.className = 'group-card';
+  card.style.setProperty('--gc', 'var(--tier-' + grp.tier + ')');
+  card.dataset.g = String(g);
+
+  var title = document.createElement('summary');
+  title.className = 'gc-title';
+  title.textContent = 'Group ' + (g + 1);
+  card.appendChild(title);
+
+  var row = document.createElement('div');
+  row.className = 'gc-row';
+  var name = document.createElement('input');
+  name.type = 'text';
+  name.placeholder = 'Group name (revealed on solve)';
+  name.dataset.g = String(g);
+  name.dataset.gfield = 'name';
+  name.value = grp.name;
+  row.appendChild(name);
+  var tier = document.createElement('select');
+  tier.dataset.g = String(g);
+  tier.dataset.gfield = 'tier';
+  [1, 2, 3, 4].forEach(function (t) {
+    var o = document.createElement('option');
+    o.value = String(t);
+    o.textContent = 'Tier ' + t;
+    if (t === grp.tier) o.selected = true;
+    tier.appendChild(o);
+  });
+  row.appendChild(tier);
+  card.appendChild(row);
+
+  var nameHint = document.createElement('p');
+  nameHint.className = 'field-hint';
+  nameHint.dataset.hintFor = 'gname-' + g;
+  nameHint.hidden = true;
+  card.appendChild(nameHint);
+
+  var expl = document.createElement('input');
+  expl.type = 'text';
+  expl.placeholder = 'One-line explanation shown on the results screen';
+  expl.dataset.g = String(g);
+  expl.dataset.gfield = 'explanation';
+  expl.value = grp.explanation;
+  card.appendChild(expl);
+
+  for (var m = 0; m < 4; m++) card.appendChild(renderItemEditor(g, m));
+  return card;
+}
+
+function renderItemEditor(g, m) {
+  var item = draftItem(g, m);
+  var box = document.createElement('div');
+  box.className = 'item-editor';
+  box.dataset.g = String(g);
+  box.dataset.m = String(m);
+
+  var row = document.createElement('div');
+  row.className = 'item-row';
+  var label = document.createElement('input');
+  label.type = 'text';
+  label.placeholder = 'Piece ' + (m + 1) + ' label';
+  label.dataset.g = String(g);
+  label.dataset.m = String(m);
+  label.dataset.ifield = 'label';
+  label.value = item.label || '';
+  row.appendChild(label);
+  var color = document.createElement('input');
+  color.type = 'color';
+  color.title = 'Piece color (sticky notes and fallbacks)';
+  color.dataset.g = String(g);
+  color.dataset.m = String(m);
+  color.dataset.ifield = 'color';
+  color.value = (item.appearance && item.appearance.color) || '#f6e58d';
+  row.appendChild(color);
+  box.appendChild(row);
+
+  var hint = document.createElement('p');
+  hint.className = 'field-hint';
+  hint.dataset.hintFor = 'label-' + g + '-' + m;
+  hint.hidden = true;
+  box.appendChild(hint);
+
+  var chips = document.createElement('div');
+  chips.className = 'kind-chips';
+  chips.setAttribute('role', 'group');
+  chips.setAttribute('aria-label', 'Piece type');
+  KIND_ORDER.forEach(function (kind) {
+    var chipBtn = document.createElement('button');
+    chipBtn.type = 'button';
+    chipBtn.className = 'kind-chip' + (item.zone === kind ? ' is-active' : '');
+    chipBtn.dataset.g = String(g);
+    chipBtn.dataset.m = String(m);
+    chipBtn.dataset.kind = kind;
+    chipBtn.setAttribute('aria-pressed', String(item.zone === kind));
+    chipBtn.textContent = PIECE_KIND_NAMES[kind];
+    chips.appendChild(chipBtn);
+  });
+  box.appendChild(chips);
+
+  var files = document.createElement('div');
+  files.className = 'adv-row';
+  var imgLabel = document.createElement('label');
+  imgLabel.textContent = 'image ';
+  var img = document.createElement('input');
+  img.type = 'file';
+  img.accept = 'image/*';
+  img.className = 'item-file';
+  img.dataset.g = String(g);
+  img.dataset.m = String(m);
+  img.dataset.ifile = 'info.image';
+  imgLabel.appendChild(img);
+  files.appendChild(imgLabel);
+  if (item.info && item.info.image) files.appendChild(fileSetMark());
+  if (item.zone === 'rack') {
+    var scopeLabel = document.createElement('label');
+    scopeLabel.textContent = 'scope image ';
+    var sc = document.createElement('input');
+    sc.type = 'file';
+    sc.accept = 'image/*';
+    sc.className = 'item-file';
+    sc.dataset.g = String(g);
+    sc.dataset.m = String(m);
+    sc.dataset.ifile = 'scope.image';
+    scopeLabel.appendChild(sc);
+    files.appendChild(scopeLabel);
+    if (item.scope && item.scope.image) files.appendChild(fileSetMark());
+  }
+  box.appendChild(files);
+
+  var adv = document.createElement('details');
+  var sum = document.createElement('summary');
+  sum.textContent = 'Advanced';
+  adv.appendChild(sum);
+  var advRow = document.createElement('div');
+  advRow.className = 'adv-row';
+  var idNote = document.createElement('span');
+  idNote.textContent = 'id: ' + item.id + ' (from the label)';
+  advRow.appendChild(idNote);
+  var infoTitle = document.createElement('input');
+  infoTitle.type = 'text';
+  infoTitle.placeholder = 'spoken title';
+  infoTitle.dataset.g = String(g);
+  infoTitle.dataset.m = String(m);
+  infoTitle.dataset.ifield = 'infoTitle';
+  infoTitle.value = (item.info && item.info.title) || '';
+  advRow.appendChild(infoTitle);
+  var infoText = document.createElement('input');
+  infoText.type = 'text';
+  infoText.placeholder = 'spoken hint text';
+  infoText.dataset.g = String(g);
+  infoText.dataset.m = String(m);
+  infoText.dataset.ifield = 'infoText';
+  infoText.value = (item.info && item.info.text) || '';
+  advRow.appendChild(infoText);
+  adv.appendChild(advRow);
+  box.appendChild(adv);
+
+  return box;
+}
+
+function fileSetMark() {
+  var s = document.createElement('span');
+  s.className = 'preview-note';
+  s.textContent = '✓ set';
+  return s;
+}
+
+function editorActionBtn(text, cls, fn) {
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = cls;
+  btn.textContent = text;
+  btn.addEventListener('click', fn);
+  return btn;
+}
+
+function renderMachineToggles() {
+  var d = state.editorDraft;
+  var wrap = document.getElementById('machine-toggles');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  var NAMES = { scope: 'Microscope', lightbox: 'Light box', printer: 'Label printer' };
+  var WARNS = {
+    scope: 'This puzzle has slides; they need the microscope.',
+    lightbox: 'This puzzle has X-ray films; they need the light box.',
+  };
+  var needs = {
+    scope: d.items.some(function (i) { return i.zone === 'rack'; }),
+    lightbox: d.items.some(function (i) { return i.zone === 'tubes'; }),
+    printer: false,
+  };
+  ALL_MACHINES.forEach(function (mch) {
+    var div = document.createElement('div');
+    div.className = 'machine-toggle';
+    var label = document.createElement('label');
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.machine = mch;
+    cb.checked = d.machines.indexOf(mch) !== -1;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(NAMES[mch]));
+    div.appendChild(label);
+    if (needs[mch] && !cb.checked) {
+      var warn = document.createElement('span');
+      warn.className = 'machine-warn';
+      warn.textContent = WARNS[mch];
+      div.appendChild(warn);
+    }
+    wrap.appendChild(div);
+  });
+}
+
+/* ── Editing (all delegated; bound once in init) ─────────────────── */
+
+function onEditorInput(ev) {
+  var t = ev.target;
+  var d = state.editorDraft;
+  if (!d) return;
+  if (t.dataset.meta) {
+    d[t.dataset.meta] = t.value;
+  } else if (t.dataset.gfield) {
+    var g = Number(t.dataset.g);
+    if (t.dataset.gfield === 'tier') {
+      d.groups[g].tier = Number(t.value);
+      var card = t.closest('.group-card');
+      if (card) card.style.setProperty('--gc', 'var(--tier-' + d.groups[g].tier + ')');
+    } else {
+      d.groups[g][t.dataset.gfield] = t.value;
+    }
+  } else if (t.dataset.ifield) {
+    var gi = Number(t.dataset.g), mi = Number(t.dataset.m);
+    var item = draftItem(gi, mi);
+    if (t.dataset.ifield === 'label') {
+      item.label = t.value;
+      autoId(gi, mi);
+      var note = t.closest('.item-editor').querySelector('details span');
+      if (note) note.textContent = 'id: ' + item.id + ' (from the label)';
+    } else if (t.dataset.ifield === 'color') {
+      item.appearance = item.appearance || {};
+      item.appearance.color = t.value;
+    } else if (t.dataset.ifield === 'infoTitle') {
+      item.info = item.info || {};
+      if (t.value) item.info.title = t.value; else delete item.info.title;
+    } else if (t.dataset.ifield === 'infoText') {
+      item.info = item.info || {};
+      if (t.value) item.info.text = t.value; else delete item.info.text;
+    }
+  } else {
+    return;
+  }
+  saveEditorDraft();
+  refreshEditorStatus();
+  pushPreview();
+}
+
+function onEditorClick(ev) {
+  var chipBtn = ev.target.closest ? ev.target.closest('.kind-chip') : null;
+  if (!chipBtn || !state.editorDraft) return;
+  var g = Number(chipBtn.dataset.g), m = Number(chipBtn.dataset.m);
+  var item = draftItem(g, m);
+  if (item.zone === chipBtn.dataset.kind) return;
+  item.zone = chipBtn.dataset.kind;
+  if (item.zone !== 'rack' && item.scope) delete item.scope;
+  saveEditorDraft();
+  // structural change: re-render this item's editor + machine warnings
+  var oldBox = chipBtn.closest('.item-editor');
+  oldBox.parentNode.replaceChild(renderItemEditor(g, m), oldBox);
+  renderMachineToggles();
+  refreshEditorStatus();
+  pushPreview();
+}
+
+function onEditorChange(ev) {
+  var t = ev.target;
+  var d = state.editorDraft;
+  if (!d) return;
+  if (t.dataset.machine) {
+    var set = new Set(d.machines);
+    if (t.checked) set.add(t.dataset.machine); else set.delete(t.dataset.machine);
+    d.machines = ALL_MACHINES.filter(function (mn) { return set.has(mn); });
+    saveEditorDraft();
+    renderMachineToggles();
+    refreshEditorStatus();
+    pushPreview();
+    return;
+  }
+  if (t.dataset.ifile && t.files && t.files[0]) {
+    var g = Number(t.dataset.g), m = Number(t.dataset.m);
+    var item = draftItem(g, m);
+    var path = t.dataset.ifile;
+    var file = t.files[0];
+    var reader = new FileReader();
+    reader.onload = function () {
+      if (path === 'info.image') {
+        item.info = item.info || {};
+        item.info.image = reader.result;
+      } else {
+        item.scope = { image: reader.result };
+      }
+      saveEditorDraft();
+      toast(file.size > 200 * 1024
+        ? 'Embedded ' + file.name + ' — heads up, ' + Math.round(file.size / 1024) + ' KB bloats the JSON.'
+        : 'Embedded ' + file.name + '.');
+      refreshEditorStatus();
+      pushPreview();
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+/* ── Validation + status chip + inline hints ─────────────────────── */
+
+function refreshEditorStatus() {
+  var d = state.editorDraft;
+  var chip = document.getElementById('editor-status-chip');
+  if (!chip || !d) return;
+
+  var issues = caseProblems(d).length;
+  for (var g = 0; g < 4; g++) {
+    var nameHint = document.querySelector('[data-hint-for="gname-' + g + '"]');
+    var emptyName = !d.groups[g].name;
+    if (emptyName) issues++;
+    if (nameHint) {
+      nameHint.hidden = !emptyName;
+      nameHint.textContent = 'Give this group a name.';
+    }
+    for (var m = 0; m < 4; m++) {
+      var item = draftItem(g, m);
+      var hint = document.querySelector('[data-hint-for="label-' + g + '-' + m + '"]');
+      var empty = !item.label;
+      if (empty) issues++;
+      if (hint) {
+        hint.hidden = !empty;
+        hint.textContent = 'Give this piece a label.';
+      }
+    }
+  }
+  chip.className = 'status-chip ' + (issues === 0 ? 'ok' : 'bad');
+  chip.textContent = issues === 0 ? 'Ready to export ✓' : issues + ' thing' + (issues === 1 ? '' : 's') + ' to fix';
+}
+
+/* ── Live preview plumbing ───────────────────────────────────────── */
+
+var previewTimer = null;
+function pushPreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(function () {
+    try { localStorage.setItem(SAVE_PREFIX + 'preview-draft', JSON.stringify(state.editorDraft)); } catch (e) { /* ignore */ }
+    var f = document.getElementById('preview-frame');
+    if (f && f.contentWindow) f.contentWindow.postMessage({ type: 'dp2d-preview' }, '*');
+  }, 300);
+}
+
+/** ?preview boot: render whatever draft the editor last pushed. */
+function bootPreviewDraft() {
+  var draft = null;
+  try { draft = JSON.parse(localStorage.getItem(SAVE_PREFIX + 'preview-draft')); } catch (e) { /* ignore */ }
+  openPuzzle(draft && typeof draft === 'object' ? draft : JSON.parse(JSON.stringify(SAMPLE_PUZZLE)));
+}
+
+/* ── Init — the ONLY place any event listener is attached ────────── */
+
+async function init() {
+  cacheEls();
+  loadSettings();
+  applyTheme();
+  if (darkQuery && darkQuery.addEventListener) {
+    darkQuery.addEventListener('change', function () {
+      if (state.settings.theme === 'system') applyTheme();
+    });
+  }
+  await loadLayout(); // defaults < layout.json (if published) < localStorage
+  applyLayout();
+  applySoundLayer(state.layout.sound);
+  loadTextures();
+  loadSoundOverrides();
+  syncSettingsUi();
+
+  // Menu + settings overlay.
+  els.btnPlayToday.addEventListener('click', playToday);
+  els.archiveList.addEventListener('click', onArchiveClick);
+  els.btnSettingsMenu.addEventListener('click', function () { showOverlay(els.overlaySettings); });
+  els.btnSettings.addEventListener('click', function () { showOverlay(els.overlaySettings); });
+  els.btnCloseSettings.addEventListener('click', function () { hideOverlay(els.overlaySettings); });
+  els.btnMute.addEventListener('click', function () {
+    state.settings.sound = !state.settings.sound;
+    saveSettings();
+    syncSettingsUi();
+  });
+  document.querySelectorAll('input[name="theme"]').forEach(function (r) {
+    r.addEventListener('change', function () { if (r.checked) setTheme(r.value); });
+  });
+  els.toggleDragWip.addEventListener('change', function () {
+    state.settings.dragAudioWip = els.toggleDragWip.checked;
+    saveSettings();
+  });
+  els.toggleCasual.addEventListener('change', function () {
+    state.settings.casual = els.toggleCasual.checked;
+    saveSettings();
+    if (state.game) {
+      state.game.casual = state.settings.casual;
+      syncHeader();
+      syncMachines();
+    }
+  });
+  els.toggleSound.addEventListener('change', function () {
+    state.settings.sound = els.toggleSound.checked;
+    saveSettings();
+    syncSettingsUi();
+  });
+
+  // Play header.
+  els.btnShuffle.addEventListener('click', onShuffle);
+  els.btnHelp.addEventListener('click', function () { showOverlay(els.overlayHelp); });
+  els.btnCloseHelp.addEventListener('click', function () { hideOverlay(els.overlayHelp); });
+  els.btnMenu.addEventListener('click', backToMenu);
+
+  // Trays (lock buttons via delegation).
+  els.trays.addEventListener('click', onTraysClick);
+
+  // Scope dock controls (static elements — direct binds, once).
+  els.scopePanel.addEventListener('click', function (ev) {
+    var pan = ev.target.closest ? ev.target.closest('.pan-btn') : null;
+    if (pan) panScope(pan.dataset.pan);
+  });
+  els.scopeCanvas.addEventListener('pointerdown', scopeCanvasDown);
+  els.zoomTrack.addEventListener('pointerdown', zoomTrackDown);
+  els.zoomTrack.addEventListener('keydown', onZoomTrackKey);
+
+  // Results.
+  els.btnShare.addEventListener('click', onShare);
+  els.btnPlayAgain.addEventListener('click', onPlayAgain);
+  els.btnBackMenu.addEventListener('click', function () {
+    hideOverlay(els.overlayResults);
+    backToMenu();
+  });
+
+  // Error screen.
+  els.btnErrorMenu.addEventListener('click', backToMenu);
+
+  // Editor (delegated; the form is rebuilt but these binds never are).
+  els.screenEditor.addEventListener('input', onEditorInput);
+  els.screenEditor.addEventListener('change', onEditorChange);
+  els.screenEditor.addEventListener('click', onEditorClick);
+
+  // Dragging + keyboard + layout — document/window level, bound once, in
+  // the CAPTURE phase so piece drags can't be starved by anything between
+  // the piece and the document (see the debug round: bubble-phase-only
+  // binding was fragile against non-bubbling synthetic events).
+  document.addEventListener('pointerdown', onPointerDown, { capture: true });
+  document.addEventListener('pointermove', onPointerMove, { capture: true, passive: false });
+  document.addEventListener('pointerup', onPointerUp, { capture: true });
+  document.addEventListener('pointercancel', onPointerCancel, { capture: true });
+  document.addEventListener('keydown', onKeyDown);
+  window.addEventListener('resize', function () {
+    if (state.game && !els.screenPlay.hidden) {
+      sizeViewer();
+      syncPieces();
+      renderScopeView();
+    }
+  });
+
+  // Beacon for live debugging: confirms WHICH wiring the browser executed.
+  document.body.setAttribute('data-dp2d-wiring', 'v7-round7');
+
+  var params = new URLSearchParams(window.location.search);
+  if (params.has('layout')) buildLayoutPanel();
+
+  if (params.has('preview')) {
+    state.previewMode = true;
+    document.body.classList.add('preview-mode');
+    window.addEventListener('message', function (ev) {
+      if (ev.data && ev.data.type === 'dp2d-preview') bootPreviewDraft();
+    });
+    bootPreviewDraft();
+    return;
+  }
+
+  if (params.has('editor')) {
+    buildEditor();
+    showScreen('screenEditor');
+    return;
+  }
+
+  refreshMenu();
+  if (!tryDeepLink()) showScreen('screenMenu');
+}
+
+// Defer normally means we run before DOMContentLoaded, but guard against
+// any environment that executes this script after the document is ready.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

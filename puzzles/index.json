@@ -1,6 +1,12 @@
 {
-  "current": "sample-001",
+  "current": "path-connections-01",
   "puzzles": [
+    {
+      "id": "path-connections-01",
+      "title": "Four Rooms, Four Diagnoses",
+      "date": "2026-07-19",
+      "file": "path-connections-01.json"
+    },
     {
       "id": "sample-001",
       "title": "The Daily Desk",

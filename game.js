@@ -461,6 +461,7 @@ var SAMPLE_INDEX = {
 
 var SAVE_PREFIX = 'dp2d:';
 var SETTINGS_KEY = SAVE_PREFIX + 'settings';
+var SEEN_HELP_KEY = SAVE_PREFIX + 'seen-help';
 var LAYOUT_KEY = SAVE_PREFIX + 'layout';
 var EDITOR_DRAFT_KEY = SAVE_PREFIX + 'editor-draft';
 /* v3 namespace: earlier layouts' saves must never half-restore here. */
@@ -1540,6 +1541,22 @@ function showScreen(name) {
 function showOverlay(el) { el.hidden = false; }
 function hideOverlay(el) { el.hidden = true; }
 
+/** First-run help: auto-open the Help overlay the first time a player
+ * opens a puzzle, then never again. Skipped entirely in the ?preview
+ * iframe and the ?editor/?layout dev pages — those aren't a player's
+ * first real puzzle. The flag is written the moment we decide to show
+ * it (not on dismiss), so a reload mid-overlay can't re-trigger it. */
+function maybeShowFirstRunHelp() {
+  if (state.previewMode || state.editorMode || state.layoutMode) return;
+  try {
+    if (localStorage.getItem(SEEN_HELP_KEY)) return;
+    localStorage.setItem(SEEN_HELP_KEY, '1');
+  } catch (e) {
+    return; // storage unavailable — don't risk showing it every load
+  }
+  showOverlay(els.overlayHelp);
+}
+
 function showErrorScreen(message) {
   els.errorMessage.textContent = message;
   showScreen('screenError');
@@ -1698,6 +1715,7 @@ function openPuzzle(puzzleData) {
 
   persistGame();
   if (game.phase === 'won' || game.phase === 'lost') showResults();
+  else maybeShowFirstRunHelp();
 }
 
 function onEngineChange() {
@@ -3494,7 +3512,7 @@ function renderEditor() {
   var iframe = document.createElement('iframe');
   iframe.id = 'preview-frame';
   iframe.title = 'Live puzzle preview';
-  iframe.src = '?preview&v=9';
+  iframe.src = '?preview&v=10';
   iframe.addEventListener('load', function () {
     // Belt-and-suspenders: if the ready handshake message was somehow
     // missed, the iframe finishing its own load is a second chance to
@@ -4417,6 +4435,7 @@ async function init() {
   }
 
   if (params.has('editor')) {
+    state.editorMode = true;
     buildEditor();
     showScreen('screenEditor');
     // renderEditor()'s own layoutPreviewStage() call ran while the editor

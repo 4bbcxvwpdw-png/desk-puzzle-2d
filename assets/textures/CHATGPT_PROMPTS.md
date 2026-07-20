@@ -119,7 +119,15 @@ edge wear.
 
 ---
 
-## Overlay sprites (assets/textures/overlays/)
+## Overlay sprites (assets/textures/overlays/) — RETIRED
+
+**As of round 9, the game no longer reads any overlay file.** The
+corner-fold and tape decorations on paper pieces were removed (they read
+as visual clutter rather than realism), and `game.js` no longer probes
+`overlays/tape-1.png`, `overlays/tape-2.png`, or `overlays/fold-1.png`.
+The files below are left on disk for reference only — dropping them into
+`assets/textures/overlays/` no longer does anything. The prompts are kept
+here in case the look ever comes back.
 
 These are DIFFERENT from the base textures: transparency is REQUIRED.
 ChatGPT image generation supports transparent backgrounds — ask for

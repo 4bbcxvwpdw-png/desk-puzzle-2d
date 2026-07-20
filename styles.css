@@ -993,48 +993,6 @@ body.has-textures .piece.textured .piece-skin ~ .piece-label { text-shadow: 0 1p
 /* when the skin carries the texture, the piece box itself goes bare */
 body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1; }
 
-.piece-fold {
-  position: absolute;
-  width: 16px; height: 16px;
-  z-index: 2;
-  pointer-events: none;
-  /* a lifted paper corner: lighter backside triangle, thin crease shadow,
-     soft falloff onto the page, so it reads as a dog-ear rather than a
-     floating triangle */
-  background:
-    linear-gradient(315deg,
-      #f8f2e1 0 38%,
-      #e3d9bf 44%,
-      rgba(36, 31, 20, 0.32) 49% 52%,
-      rgba(36, 31, 20, 0.10) 55%,
-      transparent 62%);
-  filter: drop-shadow(-1px 1px 1px rgba(36, 31, 20, 0.22));
-  opacity: 0.95;
-}
-.piece-fold.fold-tl { top: 0; left: 0; transform: rotate(90deg); }
-.piece-fold.fold-tr { top: 0; right: 0; transform: rotate(180deg); }
-.piece-fold.fold-bl { bottom: 0; left: 0; }
-.piece-fold.fold-br { bottom: 0; right: 0; transform: rotate(270deg); }
-.piece-fold.fold-tex {
-  background: var(--tex-fold-1) center / contain no-repeat;
-  filter: none;
-}
-
-.piece-tape {
-  position: absolute;
-  top: -6px;
-  left: var(--tape-x, 50%);
-  width: 34px; height: 13px;
-  z-index: 2;
-  pointer-events: none;
-  transform: translateX(-50%) rotate(var(--tape-rot, 0deg));
-  background: var(--tape-tex, linear-gradient(rgba(250, 246, 228, 0.6), rgba(238, 231, 206, 0.55)));
-  background-size: cover;
-  border: 1px solid rgba(36, 31, 20, 0.08);
-  border-radius: 1px;
-  box-shadow: 0 1px 1px rgba(36, 31, 20, 0.12);
-}
-
 /* ── Photograph (photo) — the image is the clue ──────────────────── */
 
 .piece-photo {
@@ -1227,6 +1185,10 @@ body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1;
 .overlay-card ol { padding-left: 1.2em; display: flex; flex-direction: column; gap: 6px; }
 .overlay-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 
+.results-card {
+  max-width: min(960px, 94vw);
+  max-height: 90vh;
+}
 .results-card h2 { font-size: 1.5rem; }
 #results-sub { color: var(--ink-soft); margin-bottom: 0.2em; }
 .results-hints { color: var(--ink-soft); font-size: 0.9rem; }
@@ -1261,6 +1223,45 @@ body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1;
   letter-spacing: normal;
   font-weight: 400;
   color: var(--ink-soft);
+}
+
+/* ── Article body (result-placard's optional long-form explanation) ──
+   Web-article typography: serif headings, sans body, a readable measure
+   so paragraphs don't stretch edge-to-edge of the near-full-screen card. */
+.result-article {
+  max-width: 65ch;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--panel-edge);
+}
+.result-article-heading {
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  margin: 14px 0 6px;
+}
+.result-article-heading:first-child { margin-top: 0; }
+.result-article-text {
+  font-family: var(--sans);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: var(--ink);
+  margin: 0 0 10px;
+  white-space: pre-wrap;
+}
+.result-article-figure {
+  margin: 10px 0;
+}
+.result-article-figure img {
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--panel-edge);
+}
+.result-article-caption {
+  font-family: var(--sans);
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  margin: 4px 0 0;
+  text-align: center;
 }
 
 .results-actions {
@@ -1345,24 +1346,33 @@ body.layout-mode .machine { cursor: move; outline: 2px dashed rgba(122, 79, 192,
   overflow: hidden;
 }
 
+/* The preview iframe renders at a FIXED logical size (captured once when
+   the editor boots) and is scaled down with a CSS transform to fit
+   whatever region is left beside the drawer — same trick a game engine
+   uses to decouple its render resolution from the window it's shown in.
+   .editor-preview-stage is the fit region + dark letterbox surround; the
+   iframe's own width/height/transform are set by layoutPreviewStage(). */
 .editor-preview-stage {
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: var(--paper);
+  background: #17130d;
+  overflow: hidden;
 }
 .editor-preview-stage iframe {
   display: block;
-  width: 100%;
-  height: 100%;
+  position: absolute;
   border: none;
+  box-shadow: 0 0 40px rgba(0, 0, 0, 0.4);
+  transition: transform var(--dur) var(--ease), left var(--dur) var(--ease), top var(--dur) var(--ease);
 }
+.editor-preview-stage.no-anim iframe { transition: none; }
 
 .editor-drawer {
   position: fixed;
   top: 12px;
   right: 12px;
-  width: 400px;
+  width: var(--drawer-w, 400px);
   max-width: calc(100vw - 24px);
   max-height: calc(100vh - 24px);
   overflow-y: auto;
@@ -1374,6 +1384,33 @@ body.layout-mode .machine { cursor: move; outline: 2px dashed rgba(122, 79, 192,
   transition: transform var(--dur) var(--ease);
 }
 .editor-drawer.panel-hidden { transform: translateX(calc(100% + 20px)); }
+
+.drawer-resize-handle {
+  position: absolute;
+  top: 0;
+  left: -8px;
+  width: 14px;
+  height: 100%;
+  cursor: ew-resize;
+  touch-action: none;
+  z-index: 5;
+  background: transparent;
+}
+.drawer-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 4px;
+  height: 40px;
+  border-radius: 3px;
+  background: var(--panel-edge);
+}
+.drawer-resize-handle:hover::after,
+.drawer-resize-handle.is-dragging::after {
+  background: var(--accent);
+}
 .editor-drawer h1 { font-size: 1.2rem; margin-bottom: 2px; }
 .editor-drawer .editor-sub { color: var(--ink-soft); font-size: 0.78rem; margin-bottom: 12px; }
 
@@ -1488,6 +1525,72 @@ body.layout-mode .machine { cursor: move; outline: 2px dashed rgba(122, 79, 192,
 .item-editor details .adv-row { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .item-file { font-size: 0.7rem; max-width: 170px; }
 .field-hint { color: var(--danger); font-size: 0.72rem; margin: 3px 0 0; }
+
+/* ── Article authoring (group-card's collapsible "Article" section) ── */
+.article-section {
+  margin-top: 10px;
+  border: 1px dashed var(--panel-edge);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.article-section > summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--ink-soft);
+}
+.article-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.article-block {
+  border: 1px solid var(--panel-edge);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--slot-bg);
+}
+.article-block-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.article-block-type {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+.article-block-controls { display: flex; gap: 4px; }
+.article-move, .article-remove {
+  border: 1px solid var(--panel-edge);
+  background: var(--control-bg);
+  border-radius: 4px;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.article-move:disabled { opacity: 0.35; cursor: default; }
+.article-remove { color: var(--danger); }
+.article-block input[type="text"],
+.article-block textarea {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 2px;
+}
+.article-block textarea { resize: vertical; font-family: inherit; }
+.article-add-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.article-add-btn { font-size: 0.72rem; padding: 4px 9px; }
 
 .editor-drawer .preview-note { font-size: 0.72rem; color: var(--ink-soft); margin: 10px 0 0; }
 

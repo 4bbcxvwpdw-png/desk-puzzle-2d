@@ -69,6 +69,14 @@ legacy piece-kind ids (`corkboard`/`folder`/`rack`/`tubes`/`deskCards`) are
 still read but never shown — the UI always says sticky note, paper sheet,
 index card, slide, X-ray film.
 
+Each `group` can also carry an optional `article`: an array of
+`{type, ...}` blocks — `{"type":"heading","text":"..."}`,
+`{"type":"text","text":"..."}`, or `{"type":"image","src":"...","caption":"..."}`
+(`src` is a data URI, same as an item's `info.image`) — rendered on the
+results screen under that group's one-line `explanation`. It's optional
+and backward compatible; groups (and whole puzzle files) without it render
+exactly as before.
+
 ## Keyboard play
 
 Every piece is focusable:
@@ -102,10 +110,23 @@ as layout JSON.
 chips, machine toggles (with inline warnings when a piece kind needs a
 machine you turned off), field-level validation as you type, draft
 autosave, and export of both the puzzle JSON and an updated `index.json`.
-The live preview fills the whole screen at true game size and replays the
-real game ~300ms after each edit; the authoring form floats over it as a
-collapsible drawer (edge tab to show/hide, same pattern as `?layout`). Test
-Play opens a standalone full-size run.
+Each group also has a collapsible **Article** section: an ordered list of
+heading/paragraph/image blocks (reorder or remove any block, add more with
+the buttons underneath) that becomes the group's full write-up on the
+results screen — the one-line `explanation` field stays and becomes the
+lede above it. It's optional; a group with no article renders on results
+exactly as it always has.
+
+The live preview renders the real game at a fixed size captured when the
+editor opens, then scales with the drawer: full screen when the drawer is
+tucked away (edge tab to show/hide, same pattern as `?layout`), shrunk to
+fit beside it when open, and the drawer's left edge is a drag handle to
+resize it (persisted, so it stays where you left it). Edits reach the
+preview in ~150ms — typing a field, adding an article block, or flipping a
+machine toggle all repaint it live, no Test Play required. A **Preview
+results** button shows the results screen exactly as it'll look once
+someone solves the puzzle, articles and all, without playing it out. Test
+Play still opens a standalone full-size run.
 
 ### Publishing your layout
 
@@ -135,12 +156,14 @@ Object textures should be alpha-transparent cutouts (the piece shadow
 follows the cutout); every file is auto-trimmed to its visible pixels at
 load, so margins and resolution don't matter — pieces always render at
 their standard size. Numbered alternates (`sticky-2.png`, `paper-2.png`, …)
-join the per-piece variety pool when present, and transparent overlay
-sprites can go in `assets/textures/overlays/` (`tape-1.png`, `tape-2.png`,
-`fold-1.png`). When textures are on, clue labels render in a
-handwritten style over them; printed hint labels stay machine-set so hints
-never read like clues. `CHATGPT_PROMPTS.md` in that folder has
-copy-paste-ready generation prompts.
+join the per-piece variety pool when present. Piece variety otherwise comes
+from a seeded flip/hue-brightness jitter per piece (the corner-fold and tape
+overlay decorations were removed in round 9 — they read as clutter, not
+realism; `assets/textures/overlays/` is retired, see `CHATGPT_PROMPTS.md`).
+When textures are on, clue labels render in a handwritten style over them;
+printed hint labels stay machine-set so hints never read like clues.
+`CHATGPT_PROMPTS.md` in that folder has copy-paste-ready generation
+prompts (mostly retired now, kept for reference).
 
 **Sounds — `assets/sounds/`.** Every cue is synthesized in WebAudio (no
 files needed). To replace one, list it in `assets/sounds/manifest.json`

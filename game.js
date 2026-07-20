@@ -98,6 +98,21 @@ function caseProblems(c) {
       if (grouped.has(id)) problems.push('item "' + id + '" appears in two groups');
       grouped.add(id);
     });
+    // Optional long-form explanation shown on the results screen. Light
+    // validation only — this never blocks a puzzle from loading.
+    if (g.article !== undefined) {
+      if (!Array.isArray(g.article)) {
+        problems.push('group "' + g.name + '" article must be a list of blocks');
+      } else {
+        g.article.forEach(function (block, bi) {
+          if (!block || ['heading', 'text', 'image'].indexOf(block.type) === -1) {
+            problems.push('group "' + g.name + '" article block ' + (bi + 1) + ' has an invalid type');
+          } else if (block.type === 'image' && !block.src) {
+            problems.push('group "' + g.name + '" article image block ' + (bi + 1) + ' is missing its image');
+          }
+        });
+      }
+    }
   });
   if (grouped.size !== 16) problems.push('groups cover ' + grouped.size + '/16 items');
 
@@ -1368,9 +1383,6 @@ var TEXTURE_VARS = {
   'photo-2.png': '--tex-photo-2',
   'rx.png': '--tex-rx',
   'rx-2.png': '--tex-rx-2',
-  'overlays/tape-1.png': '--tex-tape-1',
-  'overlays/tape-2.png': '--tex-tape-2',
-  'overlays/fold-1.png': '--tex-fold-1',
 };
 
 /* Numbered alternates the per-piece seed may pick from (when present). */
@@ -1825,25 +1837,6 @@ function decoratePaperPiece(b, item, rng) {
   if (tex) skin.style.setProperty('--skin-tex', tex);
   if (item.zone === 'rx') skin.style.setProperty('--skin-skew', (-1.5 + rng() * 3).toFixed(2) + 'deg');
   b.appendChild(skin);
-
-  var fold = document.createElement('span');
-  fold.className = 'piece-fold fold-' + ['tl', 'tr', 'bl', 'br'][Math.floor(rng() * 4)];
-  fold.setAttribute('aria-hidden', 'true');
-  if (state.textures && state.textures.has('overlays/fold-1.png')) fold.classList.add('fold-tex');
-  b.appendChild(fold);
-
-  if (rng() < 0.55) {
-    var tape = document.createElement('span');
-    tape.className = 'piece-tape';
-    tape.setAttribute('aria-hidden', 'true');
-    tape.style.setProperty('--tape-rot', (-20 + rng() * 40).toFixed(1) + 'deg');
-    tape.style.setProperty('--tape-x', (22 + rng() * 56).toFixed(0) + '%');
-    if (state.textures) {
-      var tapes = ['overlays/tape-1.png', 'overlays/tape-2.png'].filter(function (f) { return state.textures.has(f); });
-      if (tapes.length) tape.style.setProperty('--tape-tex', 'var(' + TEXTURE_VARS[tapes[Math.floor(rng() * tapes.length) % tapes.length]] + ')');
-    }
-    b.appendChild(tape);
-  }
 }
 
 /* Where does this piece currently live? */
@@ -2873,42 +2866,127 @@ function onShuffle() {
 
 /* ── Results overlay + share ─────────────────────────────────────── */
 
-function showResults() {
-  var game = state.game;
-  var won = game.phase === 'won';
-  els.resultsTitle.textContent = won ? 'Solved!' : 'Out of mistakes';
-  els.resultsSub.textContent = won
-    ? 'Solved with ' + game.mistakes + ' mistake' + (game.mistakes === 1 ? '' : 's') + '.'
-    : 'Here is how the groups fit together.';
-  els.resultsHints.textContent = 'Hints used: ' + state.desk.hintsUsed;
+/** heading/text/image -> a DOM node in web-article typography. Text always
+    goes through textContent and image src is always a stored data URI
+    that becomes an <img src>, never innerHTML — no injection surface even
+    though puzzle files (and drafts) are user-authored. */
+function renderArticleBlock(block) {
+  if (!block) return null;
+  if (block.type === 'heading') {
+    var h = document.createElement('h4');
+    h.className = 'result-article-heading';
+    h.textContent = block.text || '';
+    return h;
+  }
+  if (block.type === 'text') {
+    var p = document.createElement('p');
+    p.className = 'result-article-text';
+    p.textContent = block.text || '';
+    return p;
+  }
+  if (block.type === 'image' && block.src) {
+    var fig = document.createElement('figure');
+    fig.className = 'result-article-figure';
+    var img = document.createElement('img');
+    img.src = block.src;
+    img.alt = block.caption || '';
+    fig.appendChild(img);
+    if (block.caption) {
+      var cap = document.createElement('figcaption');
+      cap.className = 'result-article-caption';
+      cap.textContent = block.caption;
+      fig.appendChild(cap);
+    }
+    return fig;
+  }
+  return null;
+}
+
+/** One tier-colored placard: name, tier, items, lede (`explanation`), and
+    — if the group has one — its full article body underneath. Groups
+    without an article render exactly as before (placard + explanation). */
+function buildResultPlacard(puzzle, g, solvedGroupIds) {
+  var card = document.createElement('div');
+  card.className = 'result-placard' + (solvedGroupIds.has(g.id) ? ' solved-by-player' : '');
+  card.style.setProperty('--group-color', 'var(--tier-' + g.tier + ')');
+  var nameEl = document.createElement('p');
+  nameEl.className = 'result-placard-name';
+  nameEl.textContent = 'Tier ' + g.tier;
+  var h3 = document.createElement('h3');
+  h3.textContent = g.name;
+  var itemsEl = document.createElement('p');
+  itemsEl.className = 'result-placard-items';
+  itemsEl.textContent = g.itemIds.map(function (id) {
+    var item = puzzle.items.find(function (i) { return i.id === id; });
+    return item ? item.label : id;
+  }).join(' · ');
+  var explEl = document.createElement('p');
+  explEl.className = 'result-placard-explanation';
+  explEl.textContent = g.explanation;
+  card.appendChild(nameEl);
+  card.appendChild(h3);
+  card.appendChild(itemsEl);
+  card.appendChild(explEl);
+
+  if (Array.isArray(g.article) && g.article.length) {
+    var article = document.createElement('div');
+    article.className = 'result-article';
+    g.article.forEach(function (block) {
+      var node = renderArticleBlock(block);
+      if (node) article.appendChild(node);
+    });
+    card.appendChild(article);
+  }
+  return card;
+}
+
+/** Renders the results overlay for any puzzle + solved-group set. Both the
+    real end-of-game path (showResults) and the editor's "Preview results"
+    button funnel through here, so what you author is exactly what plays. */
+function showResultsForPuzzle(puzzle, opts) {
+  opts = opts || {};
+  els.resultsTitle.textContent = opts.title || 'Solved!';
+  els.resultsSub.textContent = opts.sub || '';
+  els.resultsHints.textContent = 'Hints used: ' + (opts.hintsUsed || 0);
 
   els.resultsGroups.innerHTML = '';
-  var solvedGroupIds = new Set(game.solved.map(function (s) { return s.groupId; }));
-  var ordered = game.puzzle.groups.slice().sort(function (a, b) { return a.tier - b.tier; });
+  var solvedGroupIds = opts.solvedGroupIds || new Set();
+  var ordered = puzzle.groups.slice().sort(function (a, b) { return a.tier - b.tier; });
   ordered.forEach(function (g) {
-    var card = document.createElement('div');
-    card.className = 'result-placard' + (solvedGroupIds.has(g.id) ? ' solved-by-player' : '');
-    card.style.setProperty('--group-color', 'var(--tier-' + g.tier + ')');
-    var nameEl = document.createElement('p');
-    nameEl.className = 'result-placard-name';
-    nameEl.textContent = 'Tier ' + g.tier;
-    var h3 = document.createElement('h3');
-    h3.textContent = g.name;
-    var itemsEl = document.createElement('p');
-    itemsEl.className = 'result-placard-items';
-    itemsEl.textContent = g.itemIds.map(function (id) { return itemById(id).label; }).join(' · ');
-    var explEl = document.createElement('p');
-    explEl.className = 'result-placard-explanation';
-    explEl.textContent = g.explanation;
-    card.appendChild(nameEl);
-    card.appendChild(h3);
-    card.appendChild(itemsEl);
-    card.appendChild(explEl);
-    els.resultsGroups.appendChild(card);
+    els.resultsGroups.appendChild(buildResultPlacard(puzzle, g, solvedGroupIds));
   });
 
   els.shareFallback.hidden = true;
   showOverlay(els.overlayResults);
+}
+
+function showResults() {
+  var game = state.game;
+  var won = game.phase === 'won';
+  var solvedGroupIds = new Set(game.solved.map(function (s) { return s.groupId; }));
+  showResultsForPuzzle(game.puzzle, {
+    title: won ? 'Solved!' : 'Out of mistakes',
+    sub: won
+      ? 'Solved with ' + game.mistakes + ' mistake' + (game.mistakes === 1 ? '' : 's') + '.'
+      : 'Here is how the groups fit together.',
+    hintsUsed: state.desk.hintsUsed,
+    solvedGroupIds: solvedGroupIds,
+  });
+}
+
+/** ?preview boot, in response to the editor's "Preview results" button:
+    load the current draft and show its results overlay as if every group
+    had just been solved — the exact game-end view, without playing. */
+function showPreviewResultsFromDraft() {
+  bootPreviewDraft();
+  if (!state.game) return;
+  var puzzle = state.game.puzzle;
+  showResultsForPuzzle(puzzle, {
+    title: 'Solved!',
+    sub: 'Solved with 0 mistakes.',
+    hintsUsed: 0,
+    solvedGroupIds: new Set(puzzle.groups.map(function (g) { return g.id; })),
+  });
 }
 
 function buildShareText() {
@@ -3350,6 +3428,7 @@ function normalizeDraft(d) {
       explanation: src.explanation || '',
       itemIds: [],
     };
+    if (Array.isArray(src.article)) grp.article = src.article;
     for (var m = 0; m < 4; m++) {
       var iid = Array.isArray(src.itemIds) ? src.itemIds[m] : null;
       var item = (iid && itemsById[iid] && !usedIds.has(iid)) ? itemsById[iid] : null;
@@ -3403,13 +3482,26 @@ function renderEditor() {
   var root = els.screenEditor;
   root.innerHTML = '';
 
-  // ── The live preview fills the whole screen, at true game size ──
+  // ── The live preview renders at a fixed logical size captured once
+  // when the editor first boots, then a CSS transform scales it to fit
+  // whatever's left beside the drawer — see layoutPreviewStage(). ──
+  if (!state.previewV) state.previewV = { w: window.innerWidth, h: window.innerHeight };
+  previewReady = false;
+  previewQueue = [];
+
   var stage = document.createElement('div');
   stage.className = 'editor-preview-stage';
   var iframe = document.createElement('iframe');
   iframe.id = 'preview-frame';
   iframe.title = 'Live puzzle preview';
-  iframe.src = '?preview&v=7';
+  iframe.src = '?preview&v=9';
+  iframe.addEventListener('load', function () {
+    // Belt-and-suspenders: if the ready handshake message was somehow
+    // missed, the iframe finishing its own load is a second chance to
+    // (re-)send the current draft — postToPreview queues harmlessly if
+    // the child hasn't signaled ready yet.
+    postToPreview({ type: 'dp2d-preview' });
+  });
   stage.appendChild(iframe);
   root.appendChild(stage);
 
@@ -3424,11 +3516,19 @@ function renderEditor() {
   tab.title = 'Show/hide the puzzle editor';
   tab.addEventListener('click', function () {
     drawer.classList.toggle('panel-hidden');
+    layoutPreviewStage();
   });
   root.appendChild(tab);
 
   var drawer = document.createElement('div');
   drawer.className = 'editor-drawer';
+  drawer.style.setProperty('--drawer-w', clampDrawerWidth(loadEditorUi().drawerW || 400) + 'px');
+
+  var resizeHandle = document.createElement('div');
+  resizeHandle.className = 'drawer-resize-handle';
+  resizeHandle.title = 'Drag to resize';
+  bindDrawerResize(resizeHandle, drawer);
+  drawer.appendChild(resizeHandle);
 
   var h1 = document.createElement('h1');
   h1.textContent = 'Puzzle Creator';
@@ -3473,6 +3573,11 @@ function renderEditor() {
     if (problems.length) { toast('Fix the flagged problems first.'); return; }
     openPuzzle(JSON.parse(JSON.stringify(state.editorDraft)));
   }));
+  actions.appendChild(editorActionBtn('Preview results', 'btn', function () {
+    var problems = caseProblems(state.editorDraft);
+    if (problems.length) { toast('Fix the flagged problems first.'); return; }
+    postToPreview({ type: 'dp2d-preview-results' });
+  }));
   actions.appendChild(editorActionBtn('Export puzzle JSON', 'btn', function () {
     downloadJson((state.editorDraft.id || 'puzzle') + '.json', state.editorDraft);
   }));
@@ -3502,7 +3607,7 @@ function renderEditor() {
 
   var note = document.createElement('p');
   note.className = 'preview-note';
-  note.textContent = 'The real game, replayed on every edit, fills the screen behind this panel. Use Test Play for a standalone full-size run, or the tab to tuck this panel away.';
+  note.textContent = 'The real game, replayed on every edit, fills the screen behind this panel — usually within a couple hundred milliseconds, no Test Play needed. Drag the drawer\'s left edge to resize it, or use the tab to tuck it away for a full-screen preview.';
   drawer.appendChild(note);
 
   root.appendChild(drawer);
@@ -3510,6 +3615,7 @@ function renderEditor() {
   renderMachineToggles();
   refreshEditorStatus();
   pushPreview();
+  layoutPreviewStage();
 }
 
 function renderGroupCard(g) {
@@ -3562,8 +3668,149 @@ function renderGroupCard(g) {
   expl.value = grp.explanation;
   card.appendChild(expl);
 
+  card.appendChild(renderArticleSection(g));
+
   for (var m = 0; m < 4; m++) card.appendChild(renderItemEditor(g, m));
   return card;
+}
+
+/** Collapsible "Article" authoring block for one group: an ordered list
+    of heading/paragraph/image blocks (each with ↑ ↓ ✕ controls) plus
+    add-buttons. Optional — a group with no blocks renders on the results
+    screen exactly as it always has (placard + one-line explanation). */
+function renderArticleSection(g) {
+  var grp = state.editorDraft.groups[g];
+  var blocks = Array.isArray(grp.article) ? grp.article : [];
+  var section = document.createElement('details');
+  section.className = 'article-section';
+  section.open = blocks.length > 0;
+
+  var sum = document.createElement('summary');
+  sum.textContent = 'Article' + (blocks.length ? ' (' + blocks.length + ' block' + (blocks.length === 1 ? '' : 's') + ')' : ' (optional — long-form explanation for the results screen)');
+  section.appendChild(sum);
+
+  var list = document.createElement('div');
+  list.className = 'article-blocks';
+  blocks.forEach(function (block, bi) {
+    list.appendChild(renderArticleBlockEditor(g, bi, block, blocks.length));
+  });
+  section.appendChild(list);
+
+  var addRow = document.createElement('div');
+  addRow.className = 'article-add-row';
+  [['heading', '+ Heading'], ['text', '+ Paragraph'], ['image', '+ Image']].forEach(function (pair) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-ghost article-add-btn';
+    btn.dataset.g = String(g);
+    btn.dataset.articleAdd = pair[0];
+    btn.textContent = pair[1];
+    addRow.appendChild(btn);
+  });
+  section.appendChild(addRow);
+
+  return section;
+}
+
+function renderArticleBlockEditor(g, bi, block, total) {
+  var row = document.createElement('div');
+  row.className = 'article-block';
+  row.dataset.g = String(g);
+  row.dataset.blockIndex = String(bi);
+
+  var head = document.createElement('div');
+  head.className = 'article-block-head';
+  var typeLabel = document.createElement('span');
+  typeLabel.className = 'article-block-type';
+  typeLabel.textContent = block.type === 'heading' ? 'Heading' : block.type === 'image' ? 'Image' : 'Paragraph';
+  head.appendChild(typeLabel);
+
+  var controls = document.createElement('div');
+  controls.className = 'article-block-controls';
+  var up = document.createElement('button');
+  up.type = 'button';
+  up.className = 'article-move';
+  up.textContent = '↑';
+  up.title = 'Move up';
+  up.dataset.g = String(g);
+  up.dataset.blockIndex = String(bi);
+  up.dataset.articleMove = 'up';
+  up.disabled = bi === 0;
+  var down = document.createElement('button');
+  down.type = 'button';
+  down.className = 'article-move';
+  down.textContent = '↓';
+  down.title = 'Move down';
+  down.dataset.g = String(g);
+  down.dataset.blockIndex = String(bi);
+  down.dataset.articleMove = 'down';
+  down.disabled = bi === total - 1;
+  var rm = document.createElement('button');
+  rm.type = 'button';
+  rm.className = 'article-remove';
+  rm.textContent = '✕';
+  rm.title = 'Remove block';
+  rm.dataset.g = String(g);
+  rm.dataset.blockIndex = String(bi);
+  rm.dataset.articleRemove = '1';
+  controls.appendChild(up);
+  controls.appendChild(down);
+  controls.appendChild(rm);
+  head.appendChild(controls);
+  row.appendChild(head);
+
+  if (block.type === 'heading') {
+    var hInput = document.createElement('input');
+    hInput.type = 'text';
+    hInput.placeholder = 'Heading text';
+    hInput.dataset.g = String(g);
+    hInput.dataset.blockIndex = String(bi);
+    hInput.dataset.bfield = 'text';
+    hInput.value = block.text || '';
+    row.appendChild(hInput);
+  } else if (block.type === 'text') {
+    var ta = document.createElement('textarea');
+    ta.placeholder = 'Paragraph text';
+    ta.rows = 3;
+    ta.dataset.g = String(g);
+    ta.dataset.blockIndex = String(bi);
+    ta.dataset.bfield = 'text';
+    ta.value = block.text || '';
+    row.appendChild(ta);
+  } else if (block.type === 'image') {
+    var fileLabel = document.createElement('label');
+    fileLabel.textContent = 'image ';
+    var file = document.createElement('input');
+    file.type = 'file';
+    file.accept = 'image/*';
+    file.className = 'item-file';
+    file.dataset.g = String(g);
+    file.dataset.blockIndex = String(bi);
+    file.dataset.bfile = 'src';
+    fileLabel.appendChild(file);
+    row.appendChild(fileLabel);
+    if (block.src) row.appendChild(fileSetMark());
+    var capInput = document.createElement('input');
+    capInput.type = 'text';
+    capInput.placeholder = 'Caption (optional)';
+    capInput.dataset.g = String(g);
+    capInput.dataset.blockIndex = String(bi);
+    capInput.dataset.bfield = 'caption';
+    capInput.value = block.caption || '';
+    row.appendChild(capInput);
+  }
+
+  return row;
+}
+
+/** Re-render just one group's article section in place (structural edits
+    — add/move/remove a block — need a fresh render; text edits don't). */
+function refreshGroupArticle(g) {
+  var card = document.querySelector('.group-card[data-g="' + g + '"]');
+  if (!card) return;
+  var old = card.querySelector('.article-section');
+  var fresh = renderArticleSection(g);
+  if (old) card.replaceChild(fresh, old); else card.appendChild(fresh);
 }
 
 function renderItemEditor(g, m) {
@@ -3746,6 +3993,9 @@ function onEditorInput(ev) {
     } else {
       d.groups[g][t.dataset.gfield] = t.value;
     }
+  } else if (t.dataset.bfield) {
+    var gb = Number(t.dataset.g), bi = Number(t.dataset.blockIndex);
+    d.groups[gb].article[bi][t.dataset.bfield] = t.value;
   } else if (t.dataset.ifield) {
     var gi = Number(t.dataset.g), mi = Number(t.dataset.m);
     var item = draftItem(gi, mi);
@@ -3773,20 +4023,63 @@ function onEditorInput(ev) {
 }
 
 function onEditorClick(ev) {
+  var d = state.editorDraft;
+  if (!d) return;
+
   var chipBtn = ev.target.closest ? ev.target.closest('.kind-chip') : null;
-  if (!chipBtn || !state.editorDraft) return;
-  var g = Number(chipBtn.dataset.g), m = Number(chipBtn.dataset.m);
-  var item = draftItem(g, m);
-  if (item.zone === chipBtn.dataset.kind) return;
-  item.zone = chipBtn.dataset.kind;
-  if (item.zone !== 'rack' && item.scope) delete item.scope;
-  saveEditorDraft();
-  // structural change: re-render this item's editor + machine warnings
-  var oldBox = chipBtn.closest('.item-editor');
-  oldBox.parentNode.replaceChild(renderItemEditor(g, m), oldBox);
-  renderMachineToggles();
-  refreshEditorStatus();
-  pushPreview();
+  if (chipBtn) {
+    var g = Number(chipBtn.dataset.g), m = Number(chipBtn.dataset.m);
+    var item = draftItem(g, m);
+    if (item.zone === chipBtn.dataset.kind) return;
+    item.zone = chipBtn.dataset.kind;
+    if (item.zone !== 'rack' && item.scope) delete item.scope;
+    saveEditorDraft();
+    // structural change: re-render this item's editor + machine warnings
+    var oldBox = chipBtn.closest('.item-editor');
+    oldBox.parentNode.replaceChild(renderItemEditor(g, m), oldBox);
+    renderMachineToggles();
+    refreshEditorStatus();
+    pushPreview();
+    return;
+  }
+
+  var addBtn = ev.target.closest ? ev.target.closest('[data-article-add]') : null;
+  if (addBtn) {
+    var ga = Number(addBtn.dataset.g);
+    var grp = d.groups[ga];
+    if (!Array.isArray(grp.article)) grp.article = [];
+    var type = addBtn.dataset.articleAdd;
+    grp.article.push(type === 'image' ? { type: 'image', src: '', caption: '' } : { type: type, text: '' });
+    saveEditorDraft();
+    refreshGroupArticle(ga);
+    refreshEditorStatus();
+    pushPreview();
+    return;
+  }
+
+  var moveBtn = ev.target.closest ? ev.target.closest('[data-article-move]') : null;
+  if (moveBtn) {
+    var gm = Number(moveBtn.dataset.g), bim = Number(moveBtn.dataset.blockIndex);
+    var arr = d.groups[gm].article;
+    var swapWith = bim + (moveBtn.dataset.articleMove === 'up' ? -1 : 1);
+    if (swapWith < 0 || swapWith >= arr.length) return;
+    var tmp = arr[bim]; arr[bim] = arr[swapWith]; arr[swapWith] = tmp;
+    saveEditorDraft();
+    refreshGroupArticle(gm);
+    pushPreview();
+    return;
+  }
+
+  var rmBtn = ev.target.closest ? ev.target.closest('[data-article-remove]') : null;
+  if (rmBtn) {
+    var gr = Number(rmBtn.dataset.g), bir = Number(rmBtn.dataset.blockIndex);
+    d.groups[gr].article.splice(bir, 1);
+    saveEditorDraft();
+    refreshGroupArticle(gr);
+    refreshEditorStatus();
+    pushPreview();
+    return;
+  }
 }
 
 function onEditorChange(ev) {
@@ -3801,6 +4094,24 @@ function onEditorChange(ev) {
     renderMachineToggles();
     refreshEditorStatus();
     pushPreview();
+    return;
+  }
+  if (t.dataset.bfile && t.files && t.files[0]) {
+    var gb = Number(t.dataset.g), bi = Number(t.dataset.blockIndex);
+    var block = d.groups[gb].article[bi];
+    var bfile = t.files[0];
+    var breader = new FileReader();
+    breader.onload = function () {
+      block.src = breader.result;
+      saveEditorDraft();
+      toast(bfile.size > 200 * 1024
+        ? 'Embedded ' + bfile.name + ' — heads up, ' + Math.round(bfile.size / 1024) + ' KB bloats the JSON.'
+        : 'Embedded ' + bfile.name + '.');
+      refreshGroupArticle(gb);
+      refreshEditorStatus();
+      pushPreview();
+    };
+    breader.readAsDataURL(bfile);
     return;
   }
   if (t.dataset.ifile && t.files && t.files[0]) {
@@ -3858,16 +4169,38 @@ function refreshEditorStatus() {
   chip.textContent = issues === 0 ? 'Ready to export ✓' : issues + ' thing' + (issues === 1 ? '' : 's') + ' to fix';
 }
 
-/* ── Live preview plumbing ───────────────────────────────────────── */
+/* ── Live preview plumbing ───────────────────────────────────────────
+ * Bug fixed in round 9: the very first pushPreview() used to fire before
+ * the iframe had even registered its own 'message' listener, so it was
+ * silently dropped and only Test Play ever showed a fresh draft. Fix is a
+ * handshake: the ?preview boot posts 'dp2d-preview-ready' once its
+ * listener is live; until that arrives, the editor queues messages and
+ * flushes them on ready (plus a re-push on the iframe's 'load' event as
+ * belt-and-suspenders). ──────────────────────────────────────────── */
 
 var previewTimer = null;
+var previewReady = false;
+var previewQueue = [];
+
 function pushPreview() {
+  try { localStorage.setItem(SAVE_PREFIX + 'preview-draft', JSON.stringify(state.editorDraft)); } catch (e) { /* ignore */ }
   clearTimeout(previewTimer);
-  previewTimer = setTimeout(function () {
-    try { localStorage.setItem(SAVE_PREFIX + 'preview-draft', JSON.stringify(state.editorDraft)); } catch (e) { /* ignore */ }
-    var f = document.getElementById('preview-frame');
-    if (f && f.contentWindow) f.contentWindow.postMessage({ type: 'dp2d-preview' }, '*');
-  }, 300);
+  previewTimer = setTimeout(function () { postToPreview({ type: 'dp2d-preview' }); }, 150);
+}
+
+/** Post to the preview iframe, queuing until it has signaled ready. */
+function postToPreview(msg) {
+  var f = document.getElementById('preview-frame');
+  if (!f) return;
+  if (!previewReady) { previewQueue.push(msg); return; }
+  if (f.contentWindow) f.contentWindow.postMessage(msg, '*');
+}
+
+function flushPreviewQueue() {
+  if (!previewQueue.length) return;
+  var queued = previewQueue;
+  previewQueue = [];
+  queued.forEach(postToPreview);
 }
 
 /** ?preview boot: render whatever draft the editor last pushed. */
@@ -3875,6 +4208,77 @@ function bootPreviewDraft() {
   var draft = null;
   try { draft = JSON.parse(localStorage.getItem(SAVE_PREFIX + 'preview-draft')); } catch (e) { /* ignore */ }
   openPuzzle(draft && typeof draft === 'object' ? draft : JSON.parse(JSON.stringify(SAMPLE_PUZZLE)));
+}
+
+/* ── Editor UI persistence (drawer width) ────────────────────────── */
+
+var EDITOR_UI_KEY = SAVE_PREFIX + 'editor-ui';
+function loadEditorUi() {
+  try { return JSON.parse(localStorage.getItem(EDITOR_UI_KEY) || '{}'); } catch (e) { return {}; }
+}
+function saveEditorUi(patch) {
+  var cur = loadEditorUi();
+  for (var k in patch) cur[k] = patch[k];
+  try { localStorage.setItem(EDITOR_UI_KEY, JSON.stringify(cur)); } catch (e) { /* ignore */ }
+}
+function clampDrawerWidth(w) {
+  return Math.max(300, Math.min(720, w));
+}
+
+/** Recompute the live-preview iframe's fixed-ratio scale + position so it
+    fits the region beside the drawer (or the full screen when the drawer
+    is collapsed), preserving V's aspect ratio. Called on drawer toggle,
+    window resize, and live while dragging the resize handle. */
+function layoutPreviewStage() {
+  var iframe = document.getElementById('preview-frame');
+  var stage = document.querySelector('.editor-preview-stage');
+  var V = state.previewV;
+  if (!iframe || !stage || !V) return;
+  var drawer = document.querySelector('.editor-drawer');
+  var drawerOpen = drawer && !drawer.classList.contains('panel-hidden');
+  var margin = 24;
+  var drawerSpace = drawerOpen ? drawer.getBoundingClientRect().width + margin : 0;
+  var regionW = Math.max(160, window.innerWidth - drawerSpace);
+  var regionH = window.innerHeight;
+  var s = Math.min(regionW / V.w, regionH / V.h);
+  var scaledW = V.w * s, scaledH = V.h * s;
+  iframe.style.width = V.w + 'px';
+  iframe.style.height = V.h + 'px';
+  iframe.style.transformOrigin = 'top left';
+  iframe.style.transform = 'scale(' + s + ')';
+  iframe.style.left = Math.max(0, (regionW - scaledW) / 2) + 'px';
+  iframe.style.top = Math.max(0, (regionH - scaledH) / 2) + 'px';
+}
+
+/** Pointer-capture drag on the drawer's left-edge strip: mutates
+    --drawer-w live (clamped ~300-720px), rescaling the preview stage on
+    every move, and persists the final width to dp2d:editor-ui. */
+function bindDrawerResize(handle, drawer) {
+  handle.addEventListener('pointerdown', function (ev) {
+    ev.preventDefault();
+    handle.setPointerCapture(ev.pointerId);
+    handle.classList.add('is-dragging');
+    var stage = document.querySelector('.editor-preview-stage');
+    if (stage) stage.classList.add('no-anim');
+    var startX = ev.clientX;
+    var startW = drawer.getBoundingClientRect().width;
+
+    function onMove(mv) {
+      var w = clampDrawerWidth(startW + (startX - mv.clientX));
+      drawer.style.setProperty('--drawer-w', w + 'px');
+      layoutPreviewStage();
+    }
+    function onUp() {
+      handle.releasePointerCapture(ev.pointerId);
+      handle.classList.remove('is-dragging');
+      if (stage) stage.classList.remove('no-anim');
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      saveEditorUi({ drawerW: drawer.getBoundingClientRect().width });
+    }
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+  });
 }
 
 /* ── Init — the ONLY place any event listener is attached ────────── */
@@ -3977,10 +4381,20 @@ async function init() {
       syncPieces();
       renderScopeView();
     }
+    if (els.screenEditor && !els.screenEditor.hidden) layoutPreviewStage();
+  });
+
+  // The editor side of the live-preview handshake: once the ?preview
+  // iframe signals it's listening, flush whatever got queued before then.
+  window.addEventListener('message', function (ev) {
+    if (ev.data && ev.data.type === 'dp2d-preview-ready') {
+      previewReady = true;
+      flushPreviewQueue();
+    }
   });
 
   // Beacon for live debugging: confirms WHICH wiring the browser executed.
-  document.body.setAttribute('data-dp2d-wiring', 'v7-round7');
+  document.body.setAttribute('data-dp2d-wiring', 'v9-round9');
 
   var params = new URLSearchParams(window.location.search);
   if (params.has('layout')) buildLayoutPanel();
@@ -3989,15 +4403,27 @@ async function init() {
     state.previewMode = true;
     document.body.classList.add('preview-mode');
     window.addEventListener('message', function (ev) {
-      if (ev.data && ev.data.type === 'dp2d-preview') bootPreviewDraft();
+      if (!ev.data) return;
+      if (ev.data.type === 'dp2d-preview') bootPreviewDraft();
+      else if (ev.data.type === 'dp2d-preview-results') showPreviewResultsFromDraft();
     });
     bootPreviewDraft();
+    // Handshake: tell the parent editor we're listening, so its very
+    // first pushPreview() isn't silently dropped before we existed.
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage({ type: 'dp2d-preview-ready' }, '*');
+    }
     return;
   }
 
   if (params.has('editor')) {
     buildEditor();
     showScreen('screenEditor');
+    // renderEditor()'s own layoutPreviewStage() call ran while the editor
+    // screen was still [hidden] (display: none), so the drawer measured
+    // 0-width and the scale it computed was wrong. Now that the screen is
+    // actually visible, redo the measurement once more.
+    layoutPreviewStage();
     return;
   }
 

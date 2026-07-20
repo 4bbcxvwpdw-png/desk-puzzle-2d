@@ -600,8 +600,9 @@ function cacheEls() {
     'machine-printer', 'printer-body', 'printer-count',
     'scope-panel', 'scope-display-wrap', 'scope-canvas',
     'zoom-track', 'zoom-knob', 'zoom-label', 'tray-hud',
-    'btn-settings', 'btn-settings-menu', 'btn-mute', 'overlay-settings',
-    'btn-close-settings', 'toggle-drag-wip',
+    'btn-reset',
+    'btn-settings', 'btn-settings-menu', 'overlay-settings',
+    'btn-close-settings',
     'overlay-help', 'btn-close-help',
     'overlay-results', 'results-title', 'results-sub', 'results-hints', 'results-groups',
     'btn-share', 'btn-play-again', 'btn-back-menu', 'share-fallback',
@@ -631,7 +632,14 @@ function loadSettings() {
       state.settings.casual = !!parsed.casual;
       state.settings.sound = parsed.sound !== false;
       if (parsed.theme === 'light' || parsed.theme === 'dark' || parsed.theme === 'system') state.settings.theme = parsed.theme;
-      state.settings.dragAudioWip = parsed.dragAudioWip === true;
+      // The "Experimental drag audio (WIP)" toggle was removed from the
+      // player-facing Settings overlay (round 10) — the round-5 velocity-
+      // bed engine and its SOUND_TUNING entries stay in the codebase for
+      // future tuning, just with no UI path to turn it on anymore, so a
+      // stale localStorage value from before this change must never
+      // silently re-enable it. Always false; the gated scrape grains are
+      // the shipped default.
+      state.settings.dragAudioWip = false;
     }
   } catch (e) { /* corrupt settings — use defaults */ }
 }
@@ -661,15 +669,13 @@ function setTheme(mode) {
 function syncSettingsUi() {
   // Null-guarded: a stale cached index.html must degrade, not crash init.
   if (els.toggleCasual) els.toggleCasual.checked = state.settings.casual;
+  // Mute lives here now (the "Sound" checkbox) — the play-header's
+  // standalone Mute button was removed (round 10); this is the only
+  // sound on/off control left.
   if (els.toggleSound) els.toggleSound.checked = state.settings.sound;
-  if (els.toggleDragWip) els.toggleDragWip.checked = state.settings.dragAudioWip;
   document.querySelectorAll('input[name="theme"]').forEach(function (r) {
     r.checked = r.value === state.settings.theme;
   });
-  if (els.btnMute) {
-    els.btnMute.textContent = state.settings.sound ? 'Mute' : 'Muted';
-    els.btnMute.setAttribute('aria-pressed', String(!state.settings.sound));
-  }
 }
 
 var LAYOUT_MERGE_KEYS = ['scope', 'lightbox', 'printer', 'scatter', 'pieceScale', 'scopePanel'];
@@ -1873,6 +1879,26 @@ function pieceLocation(id) {
  */
 function sizeViewer() {
   if (!els.screenPlay || els.screenPlay.hidden) return;
+
+  // Machines: the ?layout-authored fx/fy + pixel sizes assume a wide
+  // desktop desk (the light box in particular gets an inline px width/
+  // height from state.layout, which otherwise permanently beats the
+  // CSS media query meant to shrink it on phones — inline style always
+  // wins). Below the light box's own CSS breakpoint, clear the inline
+  // override so CSS's smaller size applies; above it, restore the
+  // authored size. Then clamp every machine's rendered position against
+  // the desk's ACTUAL box so nothing can ever render off-canvas — this
+  // is what used to force the whole phone-width page wider (and get
+  // auto-zoomed out by the browser) when a machine hung off the edge.
+  if (window.innerWidth <= 760) {
+    els.lightboxScreen.style.width = '';
+    els.lightboxScreen.style.height = '';
+  } else if (state.layout && state.layout.lightbox) {
+    els.lightboxScreen.style.width = state.layout.lightbox.w + 'px';
+    els.lightboxScreen.style.height = state.layout.lightbox.h + 'px';
+  }
+  clampMachinesToDesk();
+
   if (window.innerWidth < 900) {
     els.scopePanel.style.width = '';
     els.scopeDisplayWrap.style.width = '';
@@ -1894,6 +1920,38 @@ function sizeViewer() {
   els.scopeDisplayWrap.style.height = side + 'px';
   els.scopePanel.style.width = (side + 22) + 'px';
   renderScopeView();
+}
+
+/** Every desk machine is positioned by fx/fy — a fraction of the desk's
+    width/height, authored in ?layout for a roomy desktop desk (e.g. the
+    printer defaults to fx:0.85). On a narrow phone-width desk that same
+    fraction, combined with the machine's own (often fixed-pixel) size,
+    can push it clean past the desk's right/bottom edge — and since the
+    desk has no overflow:hidden, that doesn't just clip, it makes the
+    whole page wider than the viewport, which mobile browsers "fix" by
+    zooming the entire page out to fit (the real cause of round-10's
+    horizontal-scroll bug). Re-clamp every machine's rendered left/top
+    against the desk's ACTUAL measured box, in pixels, after every
+    layout pass — works for any fx/fy/size combination, including
+    whatever a hand-authored layout.json throws at it. */
+function clampMachinesToDesk() {
+  if (!els.deskSurface) return;
+  var deskRect = els.deskSurface.getBoundingClientRect();
+  if (!deskRect.width || !deskRect.height) return;
+  var margin = 8;
+  [els.machineScope, els.machineLightbox, els.machinePrinter].forEach(function (el) {
+    if (!el || el.hidden) return;
+    var r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    var curLeft = r.left - deskRect.left;
+    var curTop = r.top - deskRect.top;
+    var maxLeft = Math.max(margin, deskRect.width - r.width - margin);
+    var maxTop = Math.max(margin, deskRect.height - r.height - margin);
+    var newLeft = clamp(curLeft, margin, maxLeft);
+    var newTop = clamp(curTop, margin, maxTop);
+    if (Math.abs(newLeft - curLeft) > 0.5) el.style.left = newLeft + 'px';
+    if (Math.abs(newTop - curTop) > 0.5) el.style.top = newTop + 'px';
+  });
 }
 
 function syncAll() {
@@ -2277,6 +2335,18 @@ function syncPieces() {
       x = deskRect.left + p.fx * deskRect.width;
       y = deskRect.top + p.fy * deskRect.height;
       rot = state.desk.rot[id];
+      // Scatter fx/fy plus per-type pieceScale are both authored against a
+      // roomy desktop desk; on a narrow phone desk an enlarged piece near
+      // the scatter margin's edge can render with part of its box past the
+      // desk boundary — and since the desk has no overflow clip, that
+      // widens the whole page (the same class of bug the machines had).
+      // Clamp the piece's rendered half-size back inside the desk. A 1.7x
+      // safety factor stands in for the CSS scale() this box may carry
+      // (pieceScale, up to 1.6 in the shipped layout.json) plus rotation
+      // slack, without the cost of decomposing the live transform matrix.
+      var halfW = (el.offsetWidth / 2) * 1.7, halfH = (el.offsetHeight / 2) * 1.7;
+      if (halfW * 2 <= deskRect.width) x = clamp(x, deskRect.left + halfW, deskRect.left + deskRect.width - halfW);
+      if (halfH * 2 <= deskRect.height) y = clamp(y, deskRect.top + halfH, deskRect.top + deskRect.height - halfH);
     }
 
     el.style.left = x + 'px';
@@ -2332,6 +2402,11 @@ function printLabel(id) {
   }
   state.desk.labels[id] = true;
   state.desk.hintsUsed += 1;
+  // Bring the labeled piece to the front of the desk z-order so its
+  // printed label (which now overflows the piece's own box — see the
+  // .hint-label rule in styles.css) can't be covered by a neighboring
+  // piece that happens to sit on top of it.
+  state.desk.z[id] = ++state.desk.zTop;
   playSound('print');
   announce('Label printed: ' + item.label + '.');
   syncAll();
@@ -2882,24 +2957,75 @@ function onShuffle() {
   announce('Desk pieces scattered.');
 }
 
+/* ── Restricted-HTML sanitizer (rich text in article heading/text) ──────
+ * Article `text`/`heading` blocks may now carry a tiny allowlisted set of
+ * inline formatting tags — b/strong, i/em, u, br, sub, sup — authored via
+ * the editor's contenteditable + B/I/U toolbar. Everything else (a, img,
+ * script, style, on* attributes, EVERY attribute in fact) is stripped.
+ * Disallowed tags are unwrapped to their text/children, never dropped
+ * silently and never kept as-is, so e.g. `<a href=evil>click</a>` becomes
+ * plain text "click" with no link.
+ *
+ * Parsing untrusted HTML with `el.innerHTML = html` on a live DOM node is
+ * itself a footgun — a detached node still loads <img src> and can fire
+ * inline on* handlers (e.g. onerror) the instant the markup is parsed,
+ * before any walk-and-strip pass gets to run. A <template> element's
+ * `.content` is a DocumentFragment that is explicitly inert per spec: no
+ * script execution, no image/resource fetching, so parsing happens there
+ * first and nothing in the source string ever gets a chance to run. */
+var RICH_TAGS = { B: 1, STRONG: 1, I: 1, EM: 1, U: 1, BR: 1, SUB: 1, SUP: 1 };
+
+function sanitizeRichHtml(html) {
+  if (!html) return '';
+  var tpl = document.createElement('template');
+  tpl.innerHTML = String(html);
+  var out = document.createElement('div');
+  sanitizeChildrenInto(tpl.content, out);
+  return out.innerHTML;
+}
+
+/** Walk srcNode's children into outParent: allowlisted tags are rebuilt
+    fresh (never copied — so no attribute, however apparently harmless,
+    ever survives), everything else is unwrapped to its own children. */
+function sanitizeChildrenInto(srcNode, outParent) {
+  srcNode.childNodes.forEach(function (node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      outParent.appendChild(document.createTextNode(node.nodeValue));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return; // comments etc. — drop
+    if (RICH_TAGS[node.tagName]) {
+      var clean = document.createElement(node.tagName);
+      sanitizeChildrenInto(node, clean);
+      outParent.appendChild(clean);
+    } else {
+      sanitizeChildrenInto(node, outParent); // unwrap: keep text, drop tag
+    }
+  });
+}
+
 /* ── Results overlay + share ─────────────────────────────────────── */
 
-/** heading/text/image -> a DOM node in web-article typography. Text always
-    goes through textContent and image src is always a stored data URI
-    that becomes an <img src>, never innerHTML — no injection surface even
-    though puzzle files (and drafts) are user-authored. */
+/** heading/text/image -> a DOM node in web-article typography. Heading and
+    text go through sanitizeRichHtml()+innerHTML — the sanitizer's allowlist
+    is the only injection-safety boundary, so it runs here even though the
+    editor already sanitizes on every keystroke (defense in depth against a
+    hand-edited save or an imported puzzle file). Plain strings with no
+    tags pass through unchanged, so old plain-text articles render exactly
+    as before. Image src is always a stored data URI that becomes an
+    <img src>, never innerHTML. */
 function renderArticleBlock(block) {
   if (!block) return null;
   if (block.type === 'heading') {
     var h = document.createElement('h4');
     h.className = 'result-article-heading';
-    h.textContent = block.text || '';
+    h.innerHTML = sanitizeRichHtml(block.text || '');
     return h;
   }
   if (block.type === 'text') {
     var p = document.createElement('p');
     p.className = 'result-article-text';
-    p.textContent = block.text || '';
+    p.innerHTML = sanitizeRichHtml(block.text || '');
     return p;
   }
   if (block.type === 'image' && block.src) {
@@ -3081,6 +3207,24 @@ function refreshMenu() {
 function onPlayAgain() {
   hideOverlay(els.overlayResults);
   var puzzle = state.game.puzzle;
+  try { localStorage.removeItem(saveKey(puzzle.id)); } catch (e) { /* ignore */ }
+  openPuzzle(JSON.parse(JSON.stringify(puzzle)));
+}
+
+/** Toolbar "Reset" — same reset-from-scratch as onPlayAgain (fresh copy
+    of the puzzle, its save wiped so a reload can't resurrect the old
+    desk), but reachable mid-game. A quick native confirm guards it —
+    lightweight on purpose — whenever there's actual progress to lose. */
+function onResetPuzzle() {
+  var game = state.game;
+  if (!game) return;
+  var hasProgress = game.mistakes > 0 || state.desk.hintsUsed > 0
+    || game.puzzle.items.some(function (i) { return pieceLocation(i.id).kind === 'tray'; });
+  if (game.phase === 'playing' && hasProgress
+    && !window.confirm('Reset this puzzle? Staged pieces, mistakes, and hints used will all be cleared.')) {
+    return;
+  }
+  var puzzle = game.puzzle;
   try { localStorage.removeItem(saveKey(puzzle.id)); } catch (e) { /* ignore */ }
   openPuzzle(JSON.parse(JSON.stringify(puzzle)));
 }
@@ -3512,7 +3656,7 @@ function renderEditor() {
   var iframe = document.createElement('iframe');
   iframe.id = 'preview-frame';
   iframe.title = 'Live puzzle preview';
-  iframe.src = '?preview&v=10';
+  iframe.src = '?preview&v=12';
   iframe.addEventListener('load', function () {
     // Belt-and-suspenders: if the ready handshake message was somehow
     // missed, the iframe finishing its own load is a second chance to
@@ -3730,6 +3874,43 @@ function renderArticleSection(g) {
   return section;
 }
 
+/** Bold/Italic/Underline/Clear toolbar for one rich text block. Buttons
+    use execCommand on the currently-focused rich-editable — mousedown
+    (handled in onEditorMousedown) preventDefaults so the field never
+    loses focus/selection before the command fires. */
+function richToolbar(g, bi) {
+  var bar = document.createElement('div');
+  bar.className = 'rich-toolbar';
+  [['bold', 'B'], ['italic', 'I'], ['underline', 'U'], ['removeFormat', 'Clear']].forEach(function (pair) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rich-btn' + (pair[0] === 'removeFormat' ? ' rich-btn-clear' : '');
+    btn.textContent = pair[1];
+    btn.title = pair[0] === 'removeFormat' ? 'Clear formatting' : pair[1];
+    btn.dataset.g = String(g);
+    btn.dataset.blockIndex = String(bi);
+    btn.dataset.richCmd = pair[0];
+    bar.appendChild(btn);
+  });
+  return bar;
+}
+
+/** A contenteditable div storing restricted HTML (see sanitizeRichHtml).
+    Initialized through the sanitizer too, so a hand-edited draft or an
+    imported puzzle file can never seed the editor with unsafe markup. */
+function richEditable(g, bi, placeholder, extraClass, text) {
+  var el = document.createElement('div');
+  el.className = 'rich-editable ' + extraClass;
+  el.contentEditable = 'true';
+  el.dataset.g = String(g);
+  el.dataset.blockIndex = String(bi);
+  el.dataset.bfield = 'text';
+  el.dataset.rich = '1';
+  el.setAttribute('data-placeholder', placeholder);
+  el.innerHTML = sanitizeRichHtml(text || '');
+  return el;
+}
+
 function renderArticleBlockEditor(g, bi, block, total) {
   var row = document.createElement('div');
   row.className = 'article-block';
@@ -3778,22 +3959,12 @@ function renderArticleBlockEditor(g, bi, block, total) {
   row.appendChild(head);
 
   if (block.type === 'heading') {
-    var hInput = document.createElement('input');
-    hInput.type = 'text';
-    hInput.placeholder = 'Heading text';
-    hInput.dataset.g = String(g);
-    hInput.dataset.blockIndex = String(bi);
-    hInput.dataset.bfield = 'text';
-    hInput.value = block.text || '';
+    row.appendChild(richToolbar(g, bi));
+    var hInput = richEditable(g, bi, 'Heading text', 'rich-editable-heading', block.text);
     row.appendChild(hInput);
   } else if (block.type === 'text') {
-    var ta = document.createElement('textarea');
-    ta.placeholder = 'Paragraph text';
-    ta.rows = 3;
-    ta.dataset.g = String(g);
-    ta.dataset.blockIndex = String(bi);
-    ta.dataset.bfield = 'text';
-    ta.value = block.text || '';
+    row.appendChild(richToolbar(g, bi));
+    var ta = richEditable(g, bi, 'Paragraph text', 'rich-editable-text', block.text);
     row.appendChild(ta);
   } else if (block.type === 'image') {
     var fileLabel = document.createElement('label');
@@ -3994,6 +4165,219 @@ function renderMachineToggles() {
   });
 }
 
+/* ── Image upload crop/zoom/reposition modal ─────────────────────────
+ * Every editor image upload (article image blocks, item photo/scope
+ * image) funnels through openCropModal(): the raw FileReader data URI
+ * goes in, the user frames it in a fixed 4:3 viewport (zoom + drag,
+ * mouse or touch), and on confirm the ALREADY-CROPPED canvas render —
+ * not the original — is what onConfirm(dataUrl) receives and stores.
+ * Default framing is "cover" (whole frame filled, centered, no zoom
+ * beyond the minimum needed) so confirming immediately with no
+ * adjustment still produces a sane result. ──────────────────────── */
+
+var CROP_OUT_W = 640, CROP_OUT_H = 480; // stored/output resolution (4:3)
+var cropCtx = null;   // { onConfirm }
+var cropImg = null;   // { el, natW, natH, coverScale, zoomMul, offX, offY }
+
+function buildCropModal() {
+  if (els.cropOverlay) return;
+  var overlay = document.createElement('div');
+  overlay.className = 'overlay crop-overlay';
+  overlay.id = 'crop-overlay';
+  overlay.hidden = true;
+
+  var card = document.createElement('div');
+  card.className = 'overlay-card crop-card';
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-modal', 'true');
+
+  var h2 = document.createElement('h2');
+  h2.textContent = 'Position the image';
+  card.appendChild(h2);
+
+  var frame = document.createElement('div');
+  frame.className = 'crop-frame';
+  var canvas = document.createElement('canvas');
+  canvas.className = 'crop-canvas';
+  canvas.width = CROP_OUT_W;
+  canvas.height = CROP_OUT_H;
+  frame.appendChild(canvas);
+  card.appendChild(frame);
+
+  var controls = document.createElement('div');
+  controls.className = 'crop-controls';
+  var zoomLabel = document.createElement('label');
+  zoomLabel.textContent = 'Zoom ';
+  var zoom = document.createElement('input');
+  zoom.type = 'range';
+  zoom.min = '1';
+  zoom.max = '4';
+  zoom.step = '0.01';
+  zoom.value = '1';
+  zoomLabel.appendChild(zoom);
+  controls.appendChild(zoomLabel);
+  card.appendChild(controls);
+
+  var hint = document.createElement('p');
+  hint.className = 'crop-hint';
+  hint.textContent = 'Drag to reposition. Scroll, pinch, or use the slider to zoom.';
+  card.appendChild(hint);
+
+  var actions = document.createElement('div');
+  actions.className = 'overlay-actions';
+  var cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'btn btn-ghost';
+  cancel.textContent = 'Cancel';
+  var confirm = document.createElement('button');
+  confirm.type = 'button';
+  confirm.className = 'btn btn-primary';
+  confirm.textContent = 'Use image';
+  actions.appendChild(cancel);
+  actions.appendChild(confirm);
+  card.appendChild(actions);
+
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+
+  els.cropOverlay = overlay;
+  els.cropCanvas = canvas;
+  els.cropZoom = zoom;
+  els.cropCancel = cancel;
+  els.cropConfirm = confirm;
+
+  canvas.addEventListener('pointerdown', cropPointerDown);
+  canvas.addEventListener('wheel', cropWheel, { passive: false });
+  zoom.addEventListener('input', function () { setCropZoom(Number(zoom.value)); });
+  cancel.addEventListener('click', closeCropModal);
+  confirm.addEventListener('click', confirmCropModal);
+  overlay.addEventListener('click', function (ev) { if (ev.target === overlay) closeCropModal(); });
+}
+
+/** dataUrl: the raw FileReader result. onConfirm(croppedDataUrl) fires
+    once, only on confirm — cancel calls nothing. */
+function openCropModal(dataUrl, onConfirm) {
+  buildCropModal();
+  cropCtx = { onConfirm: onConfirm };
+  els.cropOverlay.hidden = false;
+  var img = new Image();
+  img.onload = function () {
+    var coverScale = Math.max(CROP_OUT_W / img.naturalWidth, CROP_OUT_H / img.naturalHeight);
+    cropImg = {
+      el: img,
+      natW: img.naturalWidth,
+      natH: img.naturalHeight,
+      coverScale: coverScale,
+      zoomMul: 1, // multiplier over coverScale; 1 = default "whole frame, no extra zoom"
+      offX: 0,
+      offY: 0,
+    };
+    centerCropImage();
+    els.cropZoom.value = '1';
+    renderCropCanvas();
+  };
+  img.src = dataUrl;
+}
+
+function closeCropModal() {
+  if (els.cropOverlay) els.cropOverlay.hidden = true;
+  cropCtx = null;
+  cropImg = null;
+}
+
+function confirmCropModal() {
+  if (!cropCtx || !cropImg) { closeCropModal(); return; }
+  var dataUrl = els.cropCanvas.toDataURL('image/jpeg', 0.85);
+  var cb = cropCtx.onConfirm;
+  closeCropModal();
+  if (cb) cb(dataUrl);
+}
+
+function centerCropImage() {
+  var scale = cropImg.coverScale * cropImg.zoomMul;
+  cropImg.offX = (CROP_OUT_W - cropImg.natW * scale) / 2;
+  cropImg.offY = (CROP_OUT_H - cropImg.natH * scale) / 2;
+}
+
+function clampCropOffsets() {
+  var scale = cropImg.coverScale * cropImg.zoomMul;
+  var w = cropImg.natW * scale, h = cropImg.natH * scale;
+  cropImg.offX = clamp(cropImg.offX, CROP_OUT_W - w, 0);
+  cropImg.offY = clamp(cropImg.offY, CROP_OUT_H - h, 0);
+}
+
+function setCropZoom(mul) {
+  if (!cropImg) return;
+  var prevScale = cropImg.coverScale * cropImg.zoomMul;
+  // Keep the frame's center point anchored while zooming, not the image's
+  // top-left corner, so zooming feels like it's centered on the viewport.
+  var cx = (CROP_OUT_W / 2 - cropImg.offX) / prevScale;
+  var cy = (CROP_OUT_H / 2 - cropImg.offY) / prevScale;
+  cropImg.zoomMul = clamp(mul, 1, 4);
+  var scale = cropImg.coverScale * cropImg.zoomMul;
+  cropImg.offX = CROP_OUT_W / 2 - cx * scale;
+  cropImg.offY = CROP_OUT_H / 2 - cy * scale;
+  clampCropOffsets();
+  els.cropZoom.value = String(cropImg.zoomMul);
+  renderCropCanvas();
+}
+
+function renderCropCanvas() {
+  if (!cropImg) return;
+  var ctx = els.cropCanvas.getContext('2d');
+  var scale = cropImg.coverScale * cropImg.zoomMul;
+  ctx.clearRect(0, 0, CROP_OUT_W, CROP_OUT_H);
+  ctx.drawImage(cropImg.el, cropImg.offX, cropImg.offY, cropImg.natW * scale, cropImg.natH * scale);
+}
+
+function cropWheel(ev) {
+  if (!cropImg) return;
+  ev.preventDefault();
+  setCropZoom(cropImg.zoomMul + (ev.deltaY < 0 ? 0.08 : -0.08));
+}
+
+function cropPointerDown(ev) {
+  if (!cropImg) return;
+  ev.preventDefault();
+  var canvas = els.cropCanvas;
+  try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+  var rect = canvas.getBoundingClientRect();
+  var ratio = CROP_OUT_W / rect.width; // CSS px -> canvas-internal px
+  var startX = ev.clientX, startY = ev.clientY;
+  var startOffX = cropImg.offX, startOffY = cropImg.offY;
+  function onMove(mv) {
+    if (!cropImg) return;
+    cropImg.offX = startOffX + (mv.clientX - startX) * ratio;
+    cropImg.offY = startOffY + (mv.clientY - startY) * ratio;
+    clampCropOffsets();
+    renderCropCanvas();
+  }
+  function onUp() {
+    canvas.removeEventListener('pointermove', onMove);
+    canvas.removeEventListener('pointerup', onUp);
+    canvas.removeEventListener('pointercancel', onUp);
+  }
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+
+/** Rough size of a data URI's decoded bytes, for the same >200KB toast
+    the raw-upload path used to show — now measuring the STORED (cropped)
+    image, since that's what actually bloats the JSON. */
+function approxDataUrlKB(dataUrl) {
+  var i = dataUrl.indexOf(',');
+  var b64 = i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
+  return Math.round((b64.length * 0.75) / 1024);
+}
+
+function sizeToast(dataUrl, name) {
+  var kb = approxDataUrlKB(dataUrl);
+  return kb > 200
+    ? 'Embedded ' + name + ' — heads up, ' + kb + ' KB bloats the JSON.'
+    : 'Embedded ' + name + '.';
+}
+
 /* ── Editing (all delegated; bound once in init) ─────────────────── */
 
 function onEditorInput(ev) {
@@ -4013,7 +4397,11 @@ function onEditorInput(ev) {
     }
   } else if (t.dataset.bfield) {
     var gb = Number(t.dataset.g), bi = Number(t.dataset.blockIndex);
-    d.groups[gb].article[bi][t.dataset.bfield] = t.value;
+    // Rich heading/text blocks are contenteditable divs — sanitize on
+    // every keystroke so the DRAFT (what gets exported / previewed) is
+    // always the restricted-HTML subset, even mid-typing. This never
+    // rewrites the live element's innerHTML, so the caret never jumps.
+    d.groups[gb].article[bi][t.dataset.bfield] = t.dataset.rich ? sanitizeRichHtml(t.innerHTML) : t.value;
   } else if (t.dataset.ifield) {
     var gi = Number(t.dataset.g), mi = Number(t.dataset.m);
     var item = draftItem(gi, mi);
@@ -4043,6 +4431,23 @@ function onEditorInput(ev) {
 function onEditorClick(ev) {
   var d = state.editorDraft;
   if (!d) return;
+
+  // Rich text toolbar (B/I/U/Clear): mousedown already preventDefault'd
+  // (see init()) so the field's focus/selection survived the click —
+  // execCommand acts on it, then re-sanitize + store the block's HTML.
+  var richBtn = ev.target.closest ? ev.target.closest('[data-rich-cmd]') : null;
+  if (richBtn) {
+    var gr = Number(richBtn.dataset.g), bir = Number(richBtn.dataset.blockIndex);
+    try { document.execCommand(richBtn.dataset.richCmd, false, null); } catch (e) { /* unsupported — no-op */ }
+    var editable = document.querySelector('.rich-editable[data-g="' + gr + '"][data-block-index="' + bir + '"]');
+    if (editable) {
+      d.groups[gr].article[bir].text = sanitizeRichHtml(editable.innerHTML);
+      saveEditorDraft();
+      refreshEditorStatus();
+      pushPreview();
+    }
+    return;
+  }
 
   var chipBtn = ev.target.closest ? ev.target.closest('.kind-chip') : null;
   if (chipBtn) {
@@ -4114,22 +4519,26 @@ function onEditorChange(ev) {
     pushPreview();
     return;
   }
+  // Every image upload goes FileReader -> crop modal -> canvas render ->
+  // THAT cropped data URI is what gets stored (never the original), so
+  // the JSON always carries an already-sized, already-framed image.
   if (t.dataset.bfile && t.files && t.files[0]) {
     var gb = Number(t.dataset.g), bi = Number(t.dataset.blockIndex);
     var block = d.groups[gb].article[bi];
     var bfile = t.files[0];
     var breader = new FileReader();
     breader.onload = function () {
-      block.src = breader.result;
-      saveEditorDraft();
-      toast(bfile.size > 200 * 1024
-        ? 'Embedded ' + bfile.name + ' — heads up, ' + Math.round(bfile.size / 1024) + ' KB bloats the JSON.'
-        : 'Embedded ' + bfile.name + '.');
-      refreshGroupArticle(gb);
-      refreshEditorStatus();
-      pushPreview();
+      openCropModal(breader.result, function (croppedDataUrl) {
+        block.src = croppedDataUrl;
+        saveEditorDraft();
+        toast(sizeToast(croppedDataUrl, bfile.name));
+        refreshGroupArticle(gb);
+        refreshEditorStatus();
+        pushPreview();
+      });
     };
     breader.readAsDataURL(bfile);
+    t.value = ''; // allow re-picking the same file later (change won't refire otherwise)
     return;
   }
   if (t.dataset.ifile && t.files && t.files[0]) {
@@ -4139,20 +4548,21 @@ function onEditorChange(ev) {
     var file = t.files[0];
     var reader = new FileReader();
     reader.onload = function () {
-      if (path === 'info.image') {
-        item.info = item.info || {};
-        item.info.image = reader.result;
-      } else {
-        item.scope = { image: reader.result };
-      }
-      saveEditorDraft();
-      toast(file.size > 200 * 1024
-        ? 'Embedded ' + file.name + ' — heads up, ' + Math.round(file.size / 1024) + ' KB bloats the JSON.'
-        : 'Embedded ' + file.name + '.');
-      refreshEditorStatus();
-      pushPreview();
+      openCropModal(reader.result, function (croppedDataUrl) {
+        if (path === 'info.image') {
+          item.info = item.info || {};
+          item.info.image = croppedDataUrl;
+        } else {
+          item.scope = { image: croppedDataUrl };
+        }
+        saveEditorDraft();
+        toast(sizeToast(croppedDataUrl, file.name));
+        refreshEditorStatus();
+        pushPreview();
+      });
     };
     reader.readAsDataURL(file);
+    t.value = '';
   }
 }
 
@@ -4323,18 +4733,13 @@ async function init() {
   els.btnSettingsMenu.addEventListener('click', function () { showOverlay(els.overlaySettings); });
   els.btnSettings.addEventListener('click', function () { showOverlay(els.overlaySettings); });
   els.btnCloseSettings.addEventListener('click', function () { hideOverlay(els.overlaySettings); });
-  els.btnMute.addEventListener('click', function () {
-    state.settings.sound = !state.settings.sound;
-    saveSettings();
-    syncSettingsUi();
-  });
   document.querySelectorAll('input[name="theme"]').forEach(function (r) {
     r.addEventListener('change', function () { if (r.checked) setTheme(r.value); });
   });
-  els.toggleDragWip.addEventListener('change', function () {
-    state.settings.dragAudioWip = els.toggleDragWip.checked;
-    saveSettings();
-  });
+  // No UI binding for dragAudioWip anymore — see the comment in
+  // loadSettings(). The engine (startDragAudio/dragAudioMove below) is
+  // still here for future tuning; it's just permanently off by default
+  // with no player-facing way to flip it on.
   els.toggleCasual.addEventListener('change', function () {
     state.settings.casual = els.toggleCasual.checked;
     saveSettings();
@@ -4352,6 +4757,7 @@ async function init() {
 
   // Play header.
   els.btnShuffle.addEventListener('click', onShuffle);
+  els.btnReset.addEventListener('click', onResetPuzzle);
   els.btnHelp.addEventListener('click', function () { showOverlay(els.overlayHelp); });
   els.btnCloseHelp.addEventListener('click', function () { hideOverlay(els.overlayHelp); });
   els.btnMenu.addEventListener('click', backToMenu);
@@ -4383,6 +4789,31 @@ async function init() {
   els.screenEditor.addEventListener('input', onEditorInput);
   els.screenEditor.addEventListener('change', onEditorChange);
   els.screenEditor.addEventListener('click', onEditorClick);
+  // Rich text toolbar: preventDefault on mousedown so the browser never
+  // shifts focus to the button before execCommand runs against the
+  // field's current selection (a plain click would collapse it first).
+  els.screenEditor.addEventListener('mousedown', function (ev) {
+    var richBtn = ev.target.closest ? ev.target.closest('[data-rich-cmd]') : null;
+    if (richBtn) ev.preventDefault();
+  });
+  // Legacy execCommand tag output (<b>/<i>/<u>, not style="") only happens
+  // with styleWithCSS off; <br> line breaks (not new <div>/<p> blocks) only
+  // with this paragraph separator — both match the sanitizer's allowlist.
+  els.screenEditor.addEventListener('focusin', function (ev) {
+    if (!ev.target.classList || !ev.target.classList.contains('rich-editable')) return;
+    try {
+      document.execCommand('styleWithCSS', false, false);
+      document.execCommand('defaultParagraphSeparator', false, 'br');
+    } catch (e) { /* ignore — best-effort */ }
+  });
+  // Paste as plain text only: the only markup a rich-editable should ever
+  // contain is what our own B/I/U toolbar puts there.
+  els.screenEditor.addEventListener('paste', function (ev) {
+    if (!ev.target.classList || !ev.target.classList.contains('rich-editable')) return;
+    ev.preventDefault();
+    var text = (ev.clipboardData || window.clipboardData).getData('text/plain');
+    document.execCommand('insertText', false, text);
+  });
 
   // Dragging + keyboard + layout — document/window level, bound once, in
   // the CAPTURE phase so piece drags can't be starved by anything between

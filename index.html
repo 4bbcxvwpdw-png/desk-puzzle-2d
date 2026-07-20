@@ -20,7 +20,7 @@
   <meta name="twitter:description" content="A cozy pathology sorting puzzle — find the four hidden diagnoses on a doctor's desk." />
   <meta name="twitter:image" content="https://4bbcxvwpdw-png.github.io/desk-puzzle-2d/og-image.png" />
 
-  <link rel="stylesheet" href="styles.css?v=10" />
+  <link rel="stylesheet" href="styles.css?v=12" />
 </head>
 <body>
   <div id="app">
@@ -72,7 +72,7 @@
         <div class="mistake-tracker" id="mistake-tracker" aria-label="Mistakes"></div>
         <div class="play-actions">
           <button id="btn-shuffle" class="btn btn-ghost" type="button">Scatter</button>
-          <button id="btn-mute" class="btn btn-ghost" type="button" aria-pressed="false" aria-label="Mute sound">Mute</button>
+          <button id="btn-reset" class="btn btn-ghost" type="button">Reset</button>
           <button id="btn-help" class="btn btn-ghost" type="button">Help</button>
           <button id="btn-settings" class="btn btn-ghost" type="button" aria-label="Settings">Settings</button>
           <button id="btn-menu" class="btn btn-ghost" type="button">Menu</button>
@@ -207,14 +207,6 @@
           </label>
         </div>
 
-        <div class="settings-group settings-dev">
-          <p class="settings-dev-label">Developer</p>
-          <label class="toggle-row">
-            <input type="checkbox" id="toggle-drag-wip" />
-            <span>Experimental drag audio (WIP)</span>
-          </label>
-        </div>
-
         <div class="overlay-actions">
           <button id="btn-close-settings" class="btn btn-primary" type="button">Done</button>
         </div>
@@ -270,6 +262,6 @@
     <div id="layout-panel" class="layout-panel" hidden></div>
   </div>
 
-  <script src="game.js?v=10" defer></script>
+  <script src="game.js?v=12" defer></script>
 </body>
 </html>

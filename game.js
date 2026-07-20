@@ -3688,6 +3688,49 @@ function normalizeDraft(d) {
   return d;
 }
 
+/* ── Import: load an existing puzzle case back into the editor ──────
+ * Two entry points feed the same funnel: a file picked from disk, or a
+ * puzzle chosen from the live registry (puzzles/index.json). Both parse
+ * to a plain object, get validated with the same caseProblems() the
+ * status chip uses, then (after an unsaved-work guard) replace the
+ * draft, get normalized exactly like any freshly-loaded draft would be,
+ * re-render the whole editor, and push the new draft to the preview. */
+
+/** True if the draft is still the untouched starter puzzle — safe to
+    replace without asking. Anything else (including a puzzle loaded a
+    moment ago) prompts a confirm before being overwritten. */
+function draftIsPristine(d) {
+  try {
+    var fresh = normalizeDraft(JSON.parse(JSON.stringify(SAMPLE_PUZZLE)));
+    return JSON.stringify(fresh) === JSON.stringify(d);
+  } catch (e) { return false; }
+}
+
+/** Validate + (optionally, after a confirm) load `candidate` into the
+    editor draft. Returns true on success; leaves the current draft
+    untouched and toasts a reason on any failure. */
+function importCaseIntoEditor(candidate, sourceLabel) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    toast('That file isn’t a puzzle (not a JSON object).');
+    return false;
+  }
+  var problems = caseProblems(candidate);
+  if (problems.length) {
+    toast('Can’t load that puzzle — ' + problems[0] +
+      (problems.length > 1 ? ' (+' + (problems.length - 1) + ' more issue' + (problems.length > 2 ? 's' : '') + ')' : '') + '.');
+    return false;
+  }
+  if (!draftIsPristine(state.editorDraft) &&
+    !window.confirm('Replace the current draft with this puzzle? Unsaved edits in the editor will be lost.')) {
+    return false;
+  }
+  state.editorDraft = normalizeDraft(JSON.parse(JSON.stringify(candidate)));
+  saveEditorDraft();
+  renderEditor();
+  toast('Loaded “' + (state.editorDraft.title || state.editorDraft.id) + '”' + (sourceLabel ? ' (' + sourceLabel + ')' : '') + ' into the editor.');
+  return true;
+}
+
 /** Slug for auto ids: "Right lung" -> "right-lung". */
 function slugify(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'item';
@@ -3734,7 +3777,7 @@ function renderEditor() {
   var iframe = document.createElement('iframe');
   iframe.id = 'preview-frame';
   iframe.title = 'Live puzzle preview';
-  iframe.src = '?preview&v=13';
+  iframe.src = '?preview&v=14';
   iframe.addEventListener('load', function () {
     // Belt-and-suspenders: if the ready handshake message was somehow
     // missed, the iframe finishing its own load is a second chance to
@@ -3808,6 +3851,72 @@ function renderEditor() {
 
   var actions = document.createElement('div');
   actions.className = 'editor-actions';
+
+  // ── Import: load an existing puzzle back in to edit + re-export ──
+  var importFile = document.createElement('input');
+  importFile.type = 'file';
+  importFile.accept = 'application/json,.json';
+  importFile.className = 'sr-only';
+  importFile.id = 'editor-import-file';
+  importFile.addEventListener('change', function () {
+    var f = importFile.files && importFile.files[0];
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var parsed;
+      try {
+        parsed = JSON.parse(String(reader.result));
+      } catch (e) {
+        toast('That file isn’t valid JSON.');
+        importFile.value = '';
+        return;
+      }
+      importCaseIntoEditor(parsed, f.name);
+      importFile.value = '';
+    };
+    reader.onerror = function () {
+      toast('Couldn’t read that file.');
+      importFile.value = '';
+    };
+    reader.readAsText(f);
+  });
+  actions.appendChild(importFile);
+  actions.appendChild(editorActionBtn('Load puzzle file', 'btn', function () {
+    importFile.click();
+  }));
+
+  var librarySelect = document.createElement('select');
+  librarySelect.className = 'editor-library-select';
+  librarySelect.id = 'editor-library-select';
+  librarySelect.title = 'Load an existing puzzle from the library into the editor';
+  var placeholderOpt = document.createElement('option');
+  placeholderOpt.value = '';
+  placeholderOpt.textContent = 'Load from library…';
+  librarySelect.appendChild(placeholderOpt);
+  loadRegistry().then(function (registry) {
+    (registry.puzzles || []).forEach(function (entry) {
+      var opt = document.createElement('option');
+      opt.value = entry.id;
+      opt.textContent = entry.title || entry.id;
+      librarySelect.appendChild(opt);
+    });
+  });
+  librarySelect.addEventListener('change', function () {
+    var id = librarySelect.value;
+    librarySelect.value = '';
+    if (!id) return;
+    loadRegistry().then(function (registry) {
+      var entry = (registry.puzzles || []).find(function (p) { return p.id === id; });
+      if (!entry) { toast('That puzzle isn’t in the library anymore.'); return; }
+      loadPuzzleByEntry(entry).then(function (candidate) {
+        importCaseIntoEditor(candidate, entry.title);
+      }).catch(function (err) {
+        toast('Couldn’t load “' + entry.title + '”: ' + err.message);
+      });
+    });
+  });
+  actions.appendChild(librarySelect);
+
   actions.appendChild(editorActionBtn('Test Play', 'btn btn-primary', function () {
     var problems = caseProblems(state.editorDraft);
     if (problems.length) { toast('Fix the flagged problems first.'); return; }

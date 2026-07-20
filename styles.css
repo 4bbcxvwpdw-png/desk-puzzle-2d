@@ -235,6 +235,7 @@ img { max-width: 100%; display: block; }
   border: 1px solid var(--panel-edge);
   border-radius: 12px;
   padding: 18px 20px;
+  min-width: 0; /* flex item of .menu-panel — don't let content push it wider */
 }
 .menu-section h2 {
   font-size: 0.78rem;
@@ -248,14 +249,60 @@ img { max-width: 100%; display: block; }
   margin-bottom: 12px;
 }
 
-.how-to-play ol {
+/* How-to-play cards: shared by the menu screen's inline section and the
+   Help overlay modal. A small icon chip + short copy per mechanic, laid
+   out as a responsive card grid instead of a numbered wall of text. */
+.howto-grid {
+  list-style: none;
   margin: 0;
-  padding-left: 1.2em;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
 }
-.how-to-play li { line-height: 1.45; }
+.howto-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--card);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--r-m);
+  padding: 10px 12px;
+  /* Grid items default to a content-based automatic minimum size (their
+     text's single-line max-content width) that ignores the track's
+     minmax(220px, ...) minimum — the classic grid/flexbox overflow trap.
+     Without this the longer cards blow the modal past the viewport on
+     narrow screens instead of wrapping. */
+  min-width: 0;
+}
+.howto-icon {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.howto-icon svg { width: 18px; height: 18px; }
+.howto-text {
+  flex: 1 1 auto;
+  min-width: 0; /* same fix, one level down: the text is a flex item too */
+  font-size: 0.83rem;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+.howto-text strong { color: var(--ink); font-family: var(--sans); }
+.howto-keys {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--panel-edge);
+  color: var(--ink-soft);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
 
 .archive-list {
   list-style: none;
@@ -714,7 +761,13 @@ img { max-width: 100%; display: block; }
     transform var(--dur) var(--ease),
     box-shadow var(--dur-fast),
     opacity var(--dur);
-  word-break: break-word;
+  /* Prefer normal word wrapping; only break inside a word when it has no
+     other way to fit (overflow-wrap), rather than the more aggressive
+     word-break: break-word, which could split short words even when a
+     plain line break would have worked — a source of the "ugly" breaks
+     the auto-fit sizing below is meant to clean up. */
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .piece:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .piece.is-dragging {
@@ -727,6 +780,20 @@ img { max-width: 100%; display: block; }
 .piece.in-tray { --pc-scale: 0.82; }
 .piece.on-machine { --pc-scale: 0.9; }
 
+/* Clue-label auto-fit (game.js fitPieceLabels()): shrinks long labels down
+   toward a readable floor so they wrap onto a tidy number of lines instead
+   of overflowing the piece. --fit-scale is written per-piece by JS after
+   measuring; it defaults to 1 (no-op) so puzzles with no long labels, and
+   any piece before the first fit pass runs, render unchanged. Balanced
+   wrapping keeps the last line from reading as a lonely short word, where
+   the browser supports it. */
+.piece-label,
+.rx-line,
+.photo-caption {
+  font-size: calc(1em * var(--fit-scale, 1));
+  text-wrap: balance;
+}
+
 /* Handwritten clue labels — applied only when the texture pass is live,
    so the plain-CSS build looks exactly as it did before. */
 body.has-textures .piece-label {
@@ -734,7 +801,7 @@ body.has-textures .piece-label {
   color: #2b2b33;
   display: inline-block;
   transform: rotate(var(--ink-rot, 0deg));
-  font-size: calc(1em * var(--ink-size, 1));
+  font-size: calc(1em * var(--ink-size, 1) * var(--fit-scale, 1));
 }
 
 /* Generated object textures include transparent padding and irregular edges.
@@ -1189,6 +1256,7 @@ body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1;
   padding: 26px 28px;
   max-width: 560px;
   width: 100%;
+  min-width: 0; /* flex item of .overlay — don't let content push it wider */
   max-height: 88vh;
   overflow-y: auto;
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
@@ -1198,7 +1266,6 @@ body.has-textures .piece.textured .piece-skin[style*="--skin-tex"] { opacity: 1;
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
-.overlay-card ol { padding-left: 1.2em; display: flex; flex-direction: column; gap: 6px; }
 .overlay-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 
 .results-card {
@@ -1540,6 +1607,9 @@ body.layout-mode .machine { cursor: move; outline: 2px dashed rgba(122, 79, 192,
 .item-editor details summary { cursor: pointer; }
 .item-editor details .adv-row { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .item-file { font-size: 0.7rem; max-width: 170px; }
+.label-scale-row input[type="range"] { flex: 1 1 100px; min-width: 80px; }
+.label-scale-readout { font-size: 0.72rem; color: var(--ink-soft); min-width: 32px; text-align: right; }
+.label-scale-row .btn { padding: 0.15em 0.6em; font-size: 0.7rem; }
 .field-hint { color: var(--danger); font-size: 0.72rem; margin: 3px 0 0; }
 
 /* ── Article authoring (group-card's collapsible "Article" section) ── */

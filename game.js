@@ -891,9 +891,13 @@ var SOUND_TUNING = {
   /* "Scatter" cue — one smooth continuous whoosh, like a sheet of paper
      moving through air: a single noise source through a bandpass whose
      center sweeps 400→1200→600 Hz, with a gently ramped attack and a
-     smooth decay to silence. No discrete bursts, no abrupt gain steps. */
+     smooth decay to silence. No discrete bursts, no abrupt gain steps.
+     Gain was 0.24 (louder than every other cue but "wrong"); brought down
+     to 0.13 — in line with the other quiet paper cues (pickup-paper 0.14,
+     drop-paper 0.22) — with a slightly slower attack so it reads as a
+     soft riffle instead of a whoosh that grabs attention. */
   'shuffle':      { synth: 'shuffle', dur: 0.7, f0: 400, f1: 1200, f2: 600,
-                     q: 0.8, attack: 0.09, gain: 0.24 },
+                     q: 0.8, attack: 0.12, gain: 0.13 },
   'correct':      { synth: 'notes', freqs: [392, 523.25], noteDur: 0.16, gain: 0.2 },
   'wrong':        { synth: 'thud', freq: 108, dur: 0.24, gain: 0.34 },
   'wrong-crack':  { synth: 'noise', dur: 0.09, hp: 2400, lp: 9000, gain: 0.2, attack: 0.002 },
@@ -1464,7 +1468,7 @@ function loadTextures() {
       root.style.setProperty(TEXTURE_VARS[f], url);
       document.body.classList.add('has-textures');
       if (f === 'desk.jpg') els.deskSurface.classList.add('textured');
-      if (state.game) syncPieces();
+      if (state.game) { fitPieceLabels(); syncPieces(); }
     };
     img.onerror = function () { /* not present — CSS look stands for this slot */ };
     img.src = 'assets/textures/' + f;
@@ -1957,10 +1961,84 @@ function clampMachinesToDesk() {
 function syncAll() {
   if (!state.game) return;
   sizeViewer();
+  fitPieceLabels();
   syncHeader();
   syncTrays();
   syncMachines();
   syncPieces();
+}
+
+/** Which element (if any) on a piece carries its readable clue text, per
+ * zone. Slides (rack) and films (tubes) read off-piece — on the microscope
+ * viewer / light box — so they're excluded; their on-piece letter/etch
+ * chips are deliberately tiny and untouched by auto-fit. A photo with an
+ * image has no caption element at all (the image IS the clue), so the
+ * lookup can come up empty — callers must check for that. */
+var LABEL_FIT_ZONES = {
+  corkboard: { sel: '.piece-label', maxLines: 3 },
+  folder:    { sel: '.piece-label', maxLines: 4 },
+  deskCards: { sel: '.piece-label', maxLines: 3 },
+  rx:        { sel: '.rx-line', maxLines: 3 },
+  photo:     { sel: '.photo-caption', maxLines: 2 },
+};
+var LABEL_FIT_MIN_PX = 9.5;   // never shrink a clue below this — stays legible
+var LABEL_FIT_STEP = 0.05;    // scale decrement per fit iteration
+var LABEL_FIT_TOLERANCE = 1.06; // 6% slack before a line count "counts" as overflow
+
+/**
+ * Auto-fit every clue label to its piece: shrink font-size (via the
+ * --fit-scale custom property, see styles.css) until the label's wrapped
+ * height fits within a per-zone line budget, or a legibility floor is
+ * hit — whichever comes first. Short labels are untouched (scale stays 1,
+ * i.e. the type's normal baseline size); only labels that would otherwise
+ * wrap awkwardly or overflow their piece shrink. Idempotent and cheap
+ * enough to call on every layout pass (16 pieces, a handful of forced
+ * reflows each) — called alongside sizeViewer() from syncAll() and the
+ * window resize handler, so it re-settles on puzzle load, resize, and
+ * every discrete game action.
+ *
+ * A per-item `labelScale` (authored in ?editor) multiplies the auto-fit
+ * result: absent/undefined means pure auto-fit; present lets an author
+ * nudge one stubborn clue smaller (fit tighter than the algorithm chose)
+ * or larger (override it, accepting the overflow risk that implies).
+ */
+function fitPieceLabels() {
+  var game = state.game;
+  if (!game || !state.pieceEls) return;
+  game.puzzle.items.forEach(function (item) {
+    var pieceEl = state.pieceEls[item.id];
+    if (!pieceEl) return;
+    var cfg = LABEL_FIT_ZONES[item.zone];
+    if (!cfg) return;
+    var textEl = pieceEl.querySelector(cfg.sel);
+    if (!textEl) return; // e.g. a photo with an image has no caption span
+    fitOneLabel(textEl, cfg.maxLines, item);
+  });
+}
+
+function fitOneLabel(textEl, maxLines, item) {
+  // Reset to the natural (unshrunk) size before measuring — otherwise a
+  // previous fit pass's scale would corrupt this one's baseline reading.
+  textEl.style.removeProperty('--fit-scale');
+  var cs = window.getComputedStyle(textEl);
+  var baseFontPx = parseFloat(cs.fontSize) || 12;
+  var lineHeightPx = parseFloat(cs.lineHeight);
+  if (!isFinite(lineHeightPx)) lineHeightPx = baseFontPx * 1.2; // 'normal' fallback
+  var lineHeightRatio = lineHeightPx / baseFontPx;
+  var floorScale = Math.min(1, LABEL_FIT_MIN_PX / baseFontPx);
+
+  var scale = 1;
+  while (scale > floorScale) {
+    var curLineHeightPx = lineHeightRatio * baseFontPx * scale;
+    var linesUsed = textEl.scrollHeight / curLineHeightPx;
+    if (linesUsed <= maxLines * LABEL_FIT_TOLERANCE) break;
+    scale = Math.max(floorScale, +(scale - LABEL_FIT_STEP).toFixed(3));
+    textEl.style.setProperty('--fit-scale', String(scale));
+  }
+
+  var override = item && isFinite(item.labelScale) && item.labelScale > 0 ? item.labelScale : null;
+  var finalScale = override ? clamp(scale * override, 0.35, 2) : scale;
+  textEl.style.setProperty('--fit-scale', String(finalScale));
 }
 
 function syncHeader() {
@@ -3656,7 +3734,7 @@ function renderEditor() {
   var iframe = document.createElement('iframe');
   iframe.id = 'preview-frame';
   iframe.title = 'Live puzzle preview';
-  iframe.src = '?preview&v=12';
+  iframe.src = '?preview&v=13';
   iframe.addEventListener('load', function () {
     // Belt-and-suspenders: if the ready handshake message was somehow
     // missed, the iframe finishing its own load is a second chance to
@@ -4108,6 +4186,42 @@ function renderItemEditor(g, m) {
   infoText.value = (item.info && item.info.text) || '';
   advRow.appendChild(infoText);
   adv.appendChild(advRow);
+
+  // Clue text size override — multiplies the auto-fit result computed at
+  // play time (see fitPieceLabels() in game.js). Absent (the default:
+  // slider centered on 100%, no override stored) means the piece just
+  // auto-fits like every other; this is only for nudging one stubborn
+  // long clue smaller, or overriding a piece an author wants bigger.
+  var sizeRow = document.createElement('div');
+  sizeRow.className = 'adv-row label-scale-row';
+  var sizeLabel = document.createElement('label');
+  sizeLabel.textContent = 'clue text size';
+  sizeRow.appendChild(sizeLabel);
+  var sizeInput = document.createElement('input');
+  sizeInput.type = 'range';
+  sizeInput.min = '0.6';
+  sizeInput.max = '1.4';
+  sizeInput.step = '0.05';
+  sizeInput.dataset.g = String(g);
+  sizeInput.dataset.m = String(m);
+  sizeInput.dataset.ifield = 'labelScale';
+  sizeInput.value = String(isFinite(item.labelScale) ? item.labelScale : 1);
+  sizeRow.appendChild(sizeInput);
+  var sizeReadout = document.createElement('span');
+  sizeReadout.className = 'label-scale-readout';
+  sizeReadout.textContent = isFinite(item.labelScale) ? Math.round(item.labelScale * 100) + '%' : 'auto';
+  sizeRow.appendChild(sizeReadout);
+  var sizeReset = document.createElement('button');
+  sizeReset.type = 'button';
+  sizeReset.className = 'btn';
+  sizeReset.textContent = 'Auto';
+  sizeReset.title = 'Clear the override, back to pure auto-fit';
+  sizeReset.dataset.g = String(g);
+  sizeReset.dataset.m = String(m);
+  sizeReset.dataset.labelScaleReset = '1';
+  sizeRow.appendChild(sizeReset);
+  adv.appendChild(sizeRow);
+
   box.appendChild(adv);
 
   return box;
@@ -4419,6 +4533,14 @@ function onEditorInput(ev) {
     } else if (t.dataset.ifield === 'infoText') {
       item.info = item.info || {};
       if (t.value) item.info.text = t.value; else delete item.info.text;
+    } else if (t.dataset.ifield === 'labelScale') {
+      var scaleV = parseFloat(t.value);
+      // Centered (1x) reads as "no override" so puzzles an author never
+      // touches this control on don't pick up a redundant stored field.
+      if (isFinite(scaleV) && Math.abs(scaleV - 1) > 0.001) item.labelScale = scaleV;
+      else delete item.labelScale;
+      var readout = t.closest('.label-scale-row').querySelector('.label-scale-readout');
+      if (readout) readout.textContent = isFinite(item.labelScale) ? Math.round(item.labelScale * 100) + '%' : 'auto';
     }
   } else {
     return;
@@ -4446,6 +4568,22 @@ function onEditorClick(ev) {
       refreshEditorStatus();
       pushPreview();
     }
+    return;
+  }
+
+  var scaleResetBtn = ev.target.closest ? ev.target.closest('[data-label-scale-reset]') : null;
+  if (scaleResetBtn) {
+    var gs = Number(scaleResetBtn.dataset.g), ms = Number(scaleResetBtn.dataset.m);
+    var itemS = draftItem(gs, ms);
+    delete itemS.labelScale;
+    var row = scaleResetBtn.closest('.label-scale-row');
+    var rangeInput = row.querySelector('input[type="range"]');
+    var readoutEl = row.querySelector('.label-scale-readout');
+    if (rangeInput) rangeInput.value = '1';
+    if (readoutEl) readoutEl.textContent = 'auto';
+    saveEditorDraft();
+    refreshEditorStatus();
+    pushPreview();
     return;
   }
 
@@ -4827,6 +4965,7 @@ async function init() {
   window.addEventListener('resize', function () {
     if (state.game && !els.screenPlay.hidden) {
       sizeViewer();
+      fitPieceLabels();
       syncPieces();
       renderScopeView();
     }

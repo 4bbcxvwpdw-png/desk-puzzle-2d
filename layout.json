@@ -41,7 +41,7 @@
       "dial-tick": 0.2,
       "pan-tick": 0.1,
       "print": 0.16,
-      "shuffle": 0.6,
+      "shuffle": 0.13,
       "correct": 0.2,
       "wrong": 0.34,
       "wrong-crack": 0.2,

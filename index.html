@@ -20,7 +20,7 @@
   <meta name="twitter:description" content="A cozy pathology sorting puzzle — find the four hidden diagnoses on a doctor's desk." />
   <meta name="twitter:image" content="https://4bbcxvwpdw-png.github.io/desk-puzzle-2d/og-image.png" />
 
-  <link rel="stylesheet" href="styles.css?v=12" />
+  <link rel="stylesheet" href="styles.css?v=13" />
 </head>
 <body>
   <div id="app">
@@ -45,12 +45,31 @@
 
         <section class="menu-section how-to-play">
           <h2>How to play</h2>
-          <ol>
-            <li>Sixteen pieces lie strewn across the desk. Drag them around to spread out and read them.</li>
-            <li>Slides and X-ray films are unreadable on their own. Put a slide on the microscope stage, or lay a film over the light box, to see what's on it.</li>
-            <li>Drag four pieces that share something into one tray, then press <strong>Lock In</strong>.</li>
-            <li>Right, and the tray locks with the group's name. Wrong, and you spend one of four guesses. "One away!" means three of the four belonged together.</li>
-            <li>Stuck on a piece? The label printer will print its name on it. You get three labels per puzzle.</li>
+          <ol class="howto-grid">
+            <li class="howto-card">
+              <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="13" height="15" rx="1.6"/><rect x="8" y="3" width="13" height="15" rx="1.6"/><line x1="11" y1="8" x2="18" y2="8"/><line x1="11" y1="11.5" x2="18" y2="11.5"/><line x1="11" y1="15" x2="16" y2="15"/></svg></span>
+              <span class="howto-text"><strong>Read the clues.</strong> Drag pieces around the desk to spread out the pile and read what each one says.</span>
+            </li>
+            <li class="howto-card">
+              <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><line x1="15.3" y1="15.3" x2="21" y2="21"/></svg></span>
+              <span class="howto-text"><strong>Some clues hide.</strong> Put a slide on the microscope stage, or lay a film across the light box, to see what's on it.</span>
+            </li>
+            <li class="howto-card">
+              <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-5.5L21 9"/><rect x="3" y="9" width="18" height="11" rx="2"/><path d="M8.5 14l2.7 2.7L16 12"/></svg></span>
+              <span class="howto-text"><strong>Lock in a group of four.</strong> Drag four pieces that belong together into a tray, then press Lock In.</span>
+            </li>
+            <li class="howto-card">
+              <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="12" r="2.1" fill="currentColor" stroke="none"/><circle cx="10" cy="12" r="2.1" fill="currentColor" stroke="none"/><circle cx="15.5" cy="12" r="2.1" fill="currentColor" stroke="none"/><circle cx="21" cy="12" r="2.1"/><path d="M19.7 10.7l2.6 2.6M22.3 10.7l-2.6 2.6"/></svg></span>
+              <span class="howto-text"><strong>Four mistakes.</strong> A wrong guess costs one of four tries, unlimited in Casual mode. "One away!" means three of the four belonged together.</span>
+            </li>
+            <li class="howto-card">
+              <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 3h6.5a2 2 0 0 1 2 2v6.5a2 2 0 0 1-.6 1.4l-9 9a2 2 0 0 1-2.8 0l-6.5-6.5a2 2 0 0 1 0-2.8l9-9a2 2 0 0 1 1.4-.6z"/><circle cx="17" cy="8" r="1.3" fill="currentColor" stroke="none"/></svg></span>
+              <span class="howto-text"><strong>Stuck? Print a label.</strong> Drop a piece on the label printer and it prints the piece's name. Three per puzzle, unlimited in Casual mode.</span>
+            </li>
+            <li class="howto-card">
+              <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-1.05 5.6"/><path d="M20 5.5V11h-5.5"/></svg></span>
+              <span class="howto-text"><strong>Scatter or reset.</strong> Scatter re-spreads the pile if it's gotten cluttered. Reset clears your progress and starts over.</span>
+            </li>
           </ol>
         </section>
 
@@ -217,15 +236,33 @@
     <div id="overlay-help" class="overlay" hidden>
       <div class="overlay-card" role="dialog" aria-modal="true" aria-labelledby="help-title">
         <h2 id="help-title">How to play</h2>
-        <ol>
-          <li>Sixteen pieces lie strewn across the desk. Drag them around freely to spread out and read them.</li>
-          <li>Sticky notes, papers, photographs, and prescription scripts read directly. Slides don't: put one on the microscope stage (each carries a letter, A, B, C, so you can tell them apart) and it appears on the big viewer. Drag the zoom between 4×, 10×, and 40×, and pan around.</li>
-          <li>X-ray films only reveal themselves over the light box: whatever part of the film lies on the glass lights up. Slide one across to read it.</li>
-          <li>Drag four pieces that share something into one tray, then press Lock In. Wrong costs one of four guesses. "One away!" means three of the four belonged together.</li>
-          <li>Stuck? Drop any piece on the label printer and it prints the piece's name on a small label. Three per puzzle, unlimited in Casual mode.</li>
-          <li>Some puzzles use fewer machines; the desk only shows what that puzzle needs.</li>
-          <li>Keyboard: Tab to a piece, 1–4 sends it to a tray, 0 or Backspace returns it to the desk, V views a slide or film on its machine, L prints a label, arrows nudge.</li>
+        <ol class="howto-grid">
+          <li class="howto-card">
+            <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="13" height="15" rx="1.6"/><rect x="8" y="3" width="13" height="15" rx="1.6"/><line x1="11" y1="8" x2="18" y2="8"/><line x1="11" y1="11.5" x2="18" y2="11.5"/><line x1="11" y1="15" x2="16" y2="15"/></svg></span>
+            <span class="howto-text"><strong>Read the clues.</strong> Sixteen pieces lie strewn across the desk. Drag them around to spread out the pile and read what each one says.</span>
+          </li>
+          <li class="howto-card">
+            <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><line x1="15.3" y1="15.3" x2="21" y2="21"/></svg></span>
+            <span class="howto-text"><strong>Some clues hide.</strong> Slides read on the microscope stage (each carries a letter, so you can tell them apart), zoom 4&times;/10&times;/40&times; and pan to look around. Films read on the light box, wherever the film overlaps the glass.</span>
+          </li>
+          <li class="howto-card">
+            <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-5.5L21 9"/><rect x="3" y="9" width="18" height="11" rx="2"/><path d="M8.5 14l2.7 2.7L16 12"/></svg></span>
+            <span class="howto-text"><strong>Lock in a group of four.</strong> Drag four pieces that belong together into a tray, then press Lock In. It locks with the group's name, colored by how tricky it was.</span>
+          </li>
+          <li class="howto-card">
+            <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="12" r="2.1" fill="currentColor" stroke="none"/><circle cx="10" cy="12" r="2.1" fill="currentColor" stroke="none"/><circle cx="15.5" cy="12" r="2.1" fill="currentColor" stroke="none"/><circle cx="21" cy="12" r="2.1"/><path d="M19.7 10.7l2.6 2.6M22.3 10.7l-2.6 2.6"/></svg></span>
+            <span class="howto-text"><strong>Four mistakes.</strong> A wrong guess costs one of four tries, unlimited in Casual mode. "One away!" means three of the four belonged together.</span>
+          </li>
+          <li class="howto-card">
+            <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 3h6.5a2 2 0 0 1 2 2v6.5a2 2 0 0 1-.6 1.4l-9 9a2 2 0 0 1-2.8 0l-6.5-6.5a2 2 0 0 1 0-2.8l9-9a2 2 0 0 1 1.4-.6z"/><circle cx="17" cy="8" r="1.3" fill="currentColor" stroke="none"/></svg></span>
+            <span class="howto-text"><strong>Stuck? Print a label.</strong> Drop any piece on the label printer and it prints the piece's name on a small stuck-on label. Three per puzzle, unlimited in Casual mode.</span>
+          </li>
+          <li class="howto-card">
+            <span class="howto-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-1.05 5.6"/><path d="M20 5.5V11h-5.5"/></svg></span>
+            <span class="howto-text"><strong>Scatter or reset.</strong> Scatter re-spreads the pile if it's gotten cluttered. Reset clears your progress and starts the puzzle over.</span>
+          </li>
         </ol>
+        <p class="howto-keys">Keyboard: Tab to a piece, 1 to 4 sends it to a tray, 0 or Backspace returns it to the desk, V views a slide or film on its machine, L prints a label, arrow keys nudge it.</p>
         <div class="overlay-actions">
           <button id="btn-close-help" class="btn btn-primary" type="button">Got it</button>
         </div>
@@ -262,6 +299,6 @@
     <div id="layout-panel" class="layout-panel" hidden></div>
   </div>
 
-  <script src="game.js?v=12" defer></script>
+  <script src="game.js?v=13" defer></script>
 </body>
 </html>

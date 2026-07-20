@@ -1,0 +1,70 @@
+{
+  "scope": {
+    "fx": 0.015,
+    "fy": 0.03
+  },
+  "lightbox": {
+    "fx": 0.72,
+    "fy": 0.03,
+    "w": 250,
+    "h": 240
+  },
+  "printer": {
+    "fx": 0.85,
+    "fy": 0.82
+  },
+  "scatter": {
+    "lo": 0.36,
+    "hi": 0.92
+  },
+  "pieceScale": {
+    "sticky": 1,
+    "paper": 1.5,
+    "slide": 0.92,
+    "film": 1.6,
+    "photo": 1.1,
+    "rx": 1.08
+  },
+  "scopePanel": {
+    "w": 300,
+    "h": 240
+  },
+  "sound": {
+    "master": 0.5,
+    "cues": {
+      "pickup-paper": 0.14,
+      "drop-paper": 0.22,
+      "pickup-glass": 0.14,
+      "drop-glass": 0.16,
+      "dock-glass": 0.17,
+      "film-rustle": 0.22,
+      "dial-tick": 0.2,
+      "pan-tick": 0.1,
+      "print": 0.16,
+      "shuffle": 0.6,
+      "correct": 0.2,
+      "wrong": 0.34,
+      "wrong-crack": 0.2,
+      "one-away": 0.12,
+      "win": 0.18,
+      "lose": 0.16
+    },
+    "scrape": {
+      "vOn": 125,
+      "vOff": 115,
+      "grainPx": 40,
+      "cooldownMs": 30,
+      "gainLo": 0.48,
+      "gainHi": 0.49,
+      "vRef": 640,
+      "pitchLo": 0.8,
+      "pitchHi": 1,
+      "volJitterDb": 0
+    },
+    "matGains": {
+      "paper": 0,
+      "slide": 0,
+      "film": 0
+    }
+  }
+}
